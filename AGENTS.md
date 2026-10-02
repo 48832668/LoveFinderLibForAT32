@@ -120,12 +120,14 @@ void EXINT1_0_IRQHandler(void) { /* exint 已由 onExti 清标志 */ key.onExti(
 ### Step 4 — 启动顺序约束
 
 ```cpp
-wk_spi1_init();   /* ★ 必须在 ST7735_Init() 之前 (SPI 时钟未开时首字节死等 TDBE) */
+wk_spi1_init();   /* ★ 必须在 lcd.init() 之前 (SPI 时钟未开时首字节死等 TDBE) */
 ...
-ST7735_Init();
+LoveFinderLib::ST7735 lcd;
+lcd.init();       /* 形参全可缺省 = 用 lf_config.h 的宏, 等价旧 ST7735_Init() */
 ```
 
-**没有 bind/init 注入步骤** —— 外设实例全部来自 `lf_config.h` 宏。
+**硬件绑定是可选注入** —— 不传形参就取 `lf_config.h` 的宏；
+要接第二块屏（另一路 SPI）各建一个实例、传对应句柄即可。
 
 ---
 
@@ -292,27 +294,62 @@ float t = ntc.getTemp();      // ℃, 无效返回 NTC_INVALID_TEMP_C
 静态换算函数 `adcToCelsius()` / `resistanceToCelsius()` / `celsiusToResistance()`
 为纯函数，逻辑可核验。
 
-### ST7735 — LCD
+### ST7735 — LCD（**实例化 API**）
 
-尺寸/偏移/旋转/颜色顺序全部参数化，面板表在 `st7735.hpp` 内
-（工程用 `ST7735_PANEL_A/B/C/D` 选择）。硬件访问直调：
+**一个 `ST7735` 对象 = 一块屏**，与 `SW3538` / `FUSB302` 同一模式。
+尺寸/偏移/旋转/颜色顺序全部参数化，面板表在 `st7735.cpp` 的 `kPanels[4]`
+（只读，所有实例共享）。
+
+> **2026-10-02 重构**：旧的 60 个 `extern "C"` 全局函数
+> （`ST7735_Init()` / `ST7735_WriteString()` / `ST7735_FillRectangle_DMA()` …）
+> **已全部删除，API 只剩实例方法一套** —— 保证唯一、不留两套并存。
+> 常量（`ST7735::RED` / `ST7735::DEG_0` / `ST7735::MADCTL` …）移进类做
+> 静态成员，尾部保留全局别名 `using ST7735 = LoveFinderLib::ST7735;`，
+> 所以 `ST7735::XXX` 这类**旧写法零改动**，只有函数调用要换成实例方法。
+> **只改了 208**（16 处调用）；907/891 尚未迁移，需自行改（按用户要求不代改）。
+
+```cpp
+LoveFinderLib::ST7735 lcd;
+lcd.init();                                   /* 形参全缺省 = lf_config.h 的宏 */
+/* lcd.init(SPI1);                           -- 只显式绑 SPI 句柄 */
+/* lcd.init(SPI1, DMA1_CHANNEL3, pins, 3);   -- 全套: SPI+DMA+引脚+面板批次 */
+
+lcd.setBacklight(true);
+lcd.fillScreen(LoveFinderLib::ST7735::BLACK);
+lcd.writeString(2, 2, "CH1 20.0V", Font_Subset_7x10,
+                LoveFinderLib::ST7735::WHITE, LoveFinderLib::ST7735::BLACK);
+```
+
+`init(spi, dma, pins, panelIdx)` 四参全可缺省，缺省时回落到 `lf_config.h`
+的 `ST7735_SPI` / `ST7735_DMA_CHANNEL` / `ST7735_*_PORT/PIN` /
+`ST7735_PANEL_*`（`ST7735_PinSet` 是**类外**定义的 `LoveFinderLib::ST7735_PinSet`：
+嵌套类型的 NSDMI 不能用作同类成员函数的默认实参，GCC 会报
+*default member initializer … required before the end of its enclosing class*）。
+
+硬件访问直调：
 
 - SPI 字节：`spi_i2s_flag_get(SPI_I2S_TDBE_FLAG)` → `spi_i2s_data_transmit`，
   翻 CS 前等 `SPI_I2S_BF_FLAG` 清零
-- GPIO：`gpio_bits_set/reset(ST7735_CS/DC/RES_PORT, …)`
-- DMA：轮询 `ST7735_DMA_CHANNEL->dtcnt == 0` + `lf_get_tick()` 超时
+- GPIO：`gpio_bits_set/reset(m_csPort/m_dcPort/m_resPort, …)`
+- DMA：轮询 `m_dma->dtcnt == 0` + `lf_get_tick()` 超时
   （**工程 NVIC 未开 DMA 中断**，与 PY32 一样纯轮询；超时关通道退回轮询发送）
 - 延时：`wk_delay_ms`
 
-```cpp
-ST7735_Init();
-ST7735_FillScreen(ST7735::BLACK);
-ST7735_WriteString(2, 2, "CH1 20.0V", Font_Subset_7x10,
-                   ST7735::WHITE, ST7735::BLACK);
-```
+**BSP 头自带**：`st7735.hpp` 直接 `#include "at32f421_spi.h"` /
+`_gpio.h` / `_dma.h`（成员要用 `spi_type` / `gpio_type` / `dma_channel_type`
+三个类型），同 §7.8，不指望 `conf.h` 条件带出。
 
-DMA 版本（`*_DMA`）使用行缓冲分块搬运 —— ST7735 是 16-bit 像素而 DMA 按
-byte 传输，需先展开成大端字节流。DMA 失败自动退回轮询。
+**状态是成员不是全局**：`m_rotation` / `m_width` / `m_height` / `m_xStart` /
+`m_yStart` / `m_panelIdx` / `m_initialized` / 句柄与引脚全是成员 ——
+旧版的文件级 `g_*` 会让两块屏互相覆盖旋转与窗口状态。
+
+**DMA 行缓冲 `m_rowBuf` 每实例一份**（`ST7735_WIDTH*2` = 320 B @160 宽），
+非线程安全，且要求 `ST7735_WIDTH` / `ST7735_HEIGHT` 编译期已知。
+16-bit 像素按 byte 搬运，先展开成大端字节流，DMA 失败自动退回轮询。
+
+**分块填充是硬约束**：实测本面板「单个地址窗口 >48x12 必花屏」，
+`fillRectangle` 内部把大矩形切成 48x12 小块，每块独立 CS→小窗口→数据→CS
+（证据链见 `st7735.cpp` 注释）；所以**没有** `fillScreenDma` 一把梭的路径。
 
 ### FontLib — 字库
 
@@ -373,21 +410,28 @@ byte 传输，需先展开成大端字节流。DMA 失败自动退回轮询。
    工程没提供时各驱动头会 `#error`（ST7735 检查引脚/外设宏）或找不到符号。
 2. **驱动直绑后不能脱离工程头做 host 侧单测** —— 需要自测时给
    `-fsyntax-only` 传工程 `inc` 路径（或把纯算法函数保持为静态纯函数）。
-3. **ST7735_Init() 前必须 wk_spi1_init()** —— SPI 时钟未开时 TDBE 永不置位，
+3. **`lcd.init()` 前必须 `wk_spi1_init()`** —— SPI 时钟未开时 TDBE 永不置位，
    首字节发送死等。
 4. **DMA 无中断依赖** —— `wk_dma.c` 未开 DMA NVIC，`DMA1_Channel3_2_IRQHandler`
    为弱定义；驱动完成判定用 `dtcnt` 轮询 + `lf_get_tick()` 超时。
    `g_lcd_dma_done` / `lf_irq_lcd_dma` 仅作预留挂点。
 5. **`i2cMasterRecover()` 只做外设软复位**，不做 GPIO 级 9 脉冲恢复。
    需要时由应用层自行实现（依赖具体引脚）。
-6. **ST7735 的 `*_DMA` 使用 static 行缓冲**（`ST7735_WIDTH * 2` 字节），
-   非线程安全，且要求 `ST7735_WIDTH` 与 `ST7735_HEIGHT` 编译期已知。
+6. **ST7735 的 DMA 行缓冲是【每实例成员】`m_rowBuf`**（`ST7735_WIDTH * 2` 字节），
+   同一实例非线程安全，且要求 `ST7735_WIDTH` 与 `ST7735_HEIGHT` 编译期已知。
 7. **WorkBench 重新生成的风险** —— `.ATWP` 里 SPI 仍配 HALF_DUPLEX/30MHz，
    工程 `main.cpp` 在 `wk_spi1_init()` 后以 C++ 断言 FULL_DUPLEX + DIV_8 对冲。
 8. **`at32f421_conf.h` 是按 `*_MODULE_ENABLED` 宏条件包含外设头的** ——
    某工程没用某外设，该 `at32f421_*.h` 就不会被包含。**模块要用哪些 BSP 头，
-   自己在 `.hpp/.cpp` 里列明**（TIMER 用 tmr/crm/misc，BUTTON 用 gpio/exint/scfg/misc），
-   不要指望 conf.h 顺带带出来，否则换个工程就编不过。
+   自己在 `.hpp/.cpp` 里列明**（TIMER 用 tmr/crm/misc，BUTTON 用 gpio/exint/scfg/misc，
+   ST7735 用 spi/gpio/dma），不要指望 conf.h 顺带带出来，否则换个工程就编不过。
+9. **ST7735 的嵌套 `PinSet` 必须定义在类外**（`LoveFinderLib::ST7735_PinSet`，
+   类内 `using PinSet = …` 保留写法）—— 嵌套类型的 NSDMI 不能用作同类
+   成员函数的默认实参，否则 GCC 报 *default member initializer … required
+   before the end of its enclosing class*。
+10. **注释里禁止 `*/` 连写**（见 §6 代码规范）—— 2026-10-02 改写 `st7735.hpp`
+    头注释时在 `(spi_*/gpio_*/dma_*)` 上踩了一次，导致后续几十行被当成代码、
+    级联 "extended character is not valid in an identifier"。
 
 ---
 
@@ -403,7 +447,12 @@ $tc  = "C:\Users\ZWDX_LKJ\AppData\Local\at32-tools"
 （POT6）、`LoveFinder208-PowerOneT1_Dual140W_Charger`。
 改库后三个工程都要编一遍（2026-10-02 改 BUTTON/TIMER 即按此验证）。
 
+> ⚠ **2026-10-02 ST7735 实例化重构后**：只有 **208** 迁移到实例 API（零警告，
+> FLASH 55 592 B / 84.83%、RAM 5 600 B / 34.18%）。**907 / 891 仍调用已删除的
+> `extern "C"` 旧函数，当前编不过** —— 按用户指示由各工程自行迁移，不代改。
+
 ---
 
-*最后更新: 2026-10-02*（新增 TIMER 模块 + BUTTON 双沿/纯标志中断/可选时基；
+*最后更新: 2026-10-02*（ST7735 改为实例化 API，删除 60 个 `extern "C"` 全局函数；
+新增 TIMER 模块 + BUTTON 双沿/纯标志中断/可选时基；
 SW3538 加通路使能 init 形参与 VBUS 推导）

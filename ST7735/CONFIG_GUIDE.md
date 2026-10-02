@@ -3,14 +3,22 @@
 ST7735 LCD 驱动：SPI 轮询 + DMA 加速，含完整图形原语与文本渲染。
 **面板批次可切换**（颜色序 / 反色极性 / RAM 偏移），**四档旋转**。
 
+> **★ 本驱动是【一个对象 = 一块屏】的实例化 API**（与 SW3538 / FUSB302 同一模式）。
+> 旧的 60 个 `extern "C"` 全局函数（`ST7735_Init()` / `ST7735_WriteString()` …）
+> **已全部删除**，API 只剩实例方法一套 —— 调用方必须先建实例。
+
 ---
 
 ## 依赖
 
-- 工程侧 `lf_config.h`（`ST7735_SPI` / `ST7735_DMA_CHANNEL` / CS·DC·RES 引脚宏）
+- 工程侧 `lf_config.h`（`ST7735_SPI` / `ST7735_DMA_CHANNEL` / CS·DC·RES 引脚宏 ——
+  全部作为 `init()` 的**缺省值**，不传形参就用它们）
 - 时基 `lf_get_tick()`（DMA 超时）与 WorkBench `wk_delay_ms()`（初始化延时）
 - FontLib（`fonts.h` + `fonts_subset.h`）
-- **前置**：调用 `ST7735_Init()` 前工程必须先 `wk_spi1_init()`
+- **前置**：调用 `lcd.init()` 前工程必须先 `wk_spi1_init()`
+- BSP 头 `at32f421_spi.h` / `at32f421_gpio.h` / `at32f421_dma.h` ——
+  **由 `st7735.hpp` 自己 include**（不能指望 `at32f421_conf.h` 条件带出，
+  见库 `AGENTS.md` §7.8）
 
 ---
 
@@ -19,33 +27,38 @@ ST7735 LCD 驱动：SPI 轮询 + DMA 加速，含完整图形原语与文本渲�
 ST7735 只是控制器型号，**不同批次的模组在颜色序 / 反色 / RAM 偏移上并不一致**。
 同一份驱动，参数不对就会出现「背光亮但全黑 / 全白 / 颜色反相」。
 
-在项目 `lf_config.h` 中定义 **且只定义一个**：
+**两种指定方式**（都有效，二选一或组合）：
 
 ```cpp
-#define ST7735_PANEL_A      // 原批次  BGR, 偏移 0/24, 不反色
-// #define ST7735_PANEL_B   // 新批次  RGB, 偏移 1/26, 需反色
-// #define ST7735_PANEL_C   // 新批次水平镜像
-// #define ST7735_PANEL_D   // A 的变体 BGR, 偏移 1/26, 需反色
+/* A. 编译期缺省 (工程 lf_config.h), 定义且只定义一个 —— 决定 init() 的第 4 参缺省 */
+#define ST7735_PANEL_D
+// #define ST7735_PANEL_A    // 原批次  BGR, 偏移 0/24, 不反色
+// #define ST7735_PANEL_B    // 新批次  RGB, 偏移 1/26, 需反色
+// #define ST7735_PANEL_C    // 新批次水平镜像
+
+/* B. 运行期指定 (不必重编译): init 第 4 参, 或 selectPanel(0..3) 后重调 init() */
+lcd.init(nullptr, nullptr, LoveFinderLib::ST7735_PinSet{}, 3);   /* 3 = Panel D */
 ```
 
 未定义任何一个时默认 **Panel A**。
 
-| 面板 | 颜色序 | 偏移 | 反色 | 适用 |
-|------|--------|------|------|------|
-| A | BGR | 0/24 | 否 | 原批次（491/907/891 当前默认） |
-| B | RGB | 1/26 | **是** | 2025-2026 新批次 |
-| C | BGR | 1/26 | **是** | 新批次水平镜像 |
-| D | BGR | 1/26 | **是** | A 的电气特性但需反色 |
+| 面板 | 颜色序 | 偏移 | 反色 | idx | 适用 |
+|------|--------|------|------|-----|------|
+| A | BGR | 0/24 | 否 | 0 | 原批次（491/907/891 当前默认） |
+| B | RGB | 1/26 | **是** | 1 | 2025-2026 新批次 |
+| C | BGR | 1/26 | **是** | 2 | 新批次水平镜像 |
+| D | BGR | 1/26 | **是** | 3 | A 的电气特性但需反色 |
 
 ---
 
 ## 2. 点屏排查（重要）
 
-**不要靠猜面板批次**——先用 `ST7735_PanelSelfTest()` 做颜色自检：
+**不要靠猜面板批次**——先用 `panelSelfTest()` 做颜色自检：
 
 ```cpp
-ST7735_Init();
-ST7735_PanelSelfTest(800);   // 依次刷 红 → 绿 → 蓝 → 白, 每个 800ms
+LoveFinderLib::ST7735 lcd;
+lcd.init();
+lcd.panelSelfTest(800);   // 依次刷 红 → 绿 → 蓝 → 白, 每个 800ms
 ```
 
 根据肉眼看到的现象判断：
@@ -56,7 +69,7 @@ ST7735_PanelSelfTest(800);   // 依次刷 红 → 绿 → 蓝 → 白, 每个 80
 | 红显示成青/蓝绿 | 面板需要反色 | 换 `ST7735_PANEL_B` 或 `_D` |
 | 红显示成蓝 | R/B 通道颠倒 | 颜色序配反了（A↔B 互换） |
 | 画面整体偏移 | RAM 偏移不对 | 换到偏移 1/26 的面板 |
-| 画面上下/左右颠倒 | 旋转档位不对 | 换 `ST7735_ROTATION` |
+| 画面上下/左右颠倒 | 旋转档位不对 | 换 `ST7735_ROTATION` 或 `setRotation()` |
 | **始终全黑/全白** | **SPI 数据没到屏上** | 查焊接 / SCK / MOSI / CS / 时钟 |
 
 > 「全黑/全白、毫无变化」几乎可以断定是**硬件或 SPI 通路**问题，而非面板参数——
@@ -66,8 +79,8 @@ ST7735_PanelSelfTest(800);   // 依次刷 红 → 绿 → 蓝 → 白, 每个 80
 **另一种快速验证**：全屏纯红。
 
 ```cpp
-ST7735_Init();
-ST7735_FillScreen(ST7735::RED);
+lcd.init();
+lcd.fillScreen(LoveFinderLib::ST7735::RED);
 ```
 
 ---
@@ -102,8 +115,14 @@ ST7735_FillScreen(ST7735::RED);
 #define ST7735_EN_PIN           LCD_EN_PIN
 ```
 
-> `ST7735_ROTATION` 的值在 `st7735.hpp` 的命名空间内定义，
-> 所以宏值需写成 `ST7735::DEG_0` 这种形式。
+> `ST7735_ROTATION` 的值必须写成 `ST7735::DEG_0` 这种形式。
+> 常量（`DEG_0` / `RED` / `MADCTL` …）现在是**类的静态成员**，
+> `st7735.hpp` 尾部有一条全局别名 `using ST7735 = LoveFinderLib::ST7735;`
+> —— 所以 `ST7735::DEG_0` 这类旧写法**完全不用改**，且展开点在类内时
+> 也能正确解析到类自身。
+
+**这些宏现在只是 `init()` 的缺省值**：不想用宏时，全套引脚/SPI/DMA 都可以
+通过形参传入（见 §5），宏仍然必须定义（缺失即 `#error`）。
 
 ---
 
@@ -116,15 +135,13 @@ ST7735_FillScreen(ST7735::RED);
      **正确模式**（半双工单线走 PA7/MOSI）。唯一必须覆盖的是时钟：
      WorkBench 默认 30MHz(DIV_4) 超标，需改 `DIV_8`(15MHz)。
 2. （可选）`ST7735_USE_DMA=1` 时，SPI TX DMA 通道配置为内存→外设、
-   **字节**宽度、**非循环模式**；`=0`（当前工程）则全部走 `spiWriteByte`
-   轮询，无需 DMA
+   **字节**宽度、**非循环模式**；`=0` 则全部走 `spiWriteByte` 轮询
    - AT32F421：`DMA1_CHANNEL3` 固定映射为 `SPI1_TX`
 3. **无需 DMA 中断**：完成判定轮询 `dtcnt == 0` + `lf_get_tick()` 超时
-   （工程 NVIC 未开 DMA 中断，弱定义 handler 无碍；
-   可选把 `lf_irq_lcd_dma()` 挂到 `DMA1_Channel3_2_IRQHandler` 置
-   `g_lcd_dma_done`，但驱动不依赖它）
-4. **无需注入句柄**：`ST7735_SPI` / `ST7735_DMA_CHANNEL` / 引脚宏全部来自
-   工程 `lf_config.h`，`ST7735_Init()` 内部自配 CS/DC/RES 推挽输出
+   （工程 NVIC 未开 DMA 中断，弱定义 handler 无碍）
+4. **句柄绑定是可选的**：`init()` 不传参 = 用 `lf_config.h` 的宏；
+   传了就用传入的（多屏/换 SPI 时各建一个实例即可）
+5. `init()` 内部自配 CS/DC/RES 推挽输出与初始电平
 
 ---
 
@@ -134,78 +151,114 @@ ST7735_FillScreen(ST7735::RED);
 #include "st7735.hpp"
 #include "fonts_subset.h"
 
-ST7735_Init();
-ST7735_FillScreen(ST7735::BLACK);
+namespace app { inline LoveFinderLib::ST7735 g_lcd; }   /* 一屏一实例 */
+
+/* ---- 初始化: 三种绑定力度 ---- */
+g_lcd.init();                                  /* 全用 lf_config.h 的宏 (= 旧行为) */
+g_lcd.init(SPI1);                              /* 只显式绑 SPI 句柄 */
+g_lcd.init(SPI1, DMA1_CHANNEL3, pins, 3);      /* 全套: SPI + DMA + 引脚 + Panel D */
+/*                          ↑ LoveFinderLib::ST7735_PinSet{} 可缺省 */
+
+g_lcd.setBacklight(true);
+
+/* ---- 绘制 ---- */
+g_lcd.fillScreen(LoveFinderLib::ST7735::BLACK);
 
 /* 文本 (模式 B 字符级子集, 只把用到的字符编进固件) */
-ST7735_WriteString(2, 2, "Hello", Font_Subset_7x10,
-                   ST7735::WHITE, ST7735::BLACK);
+g_lcd.writeString(2, 2, "Hello", Font_Subset_7x10,
+                  LoveFinderLib::ST7735::WHITE, LoveFinderLib::ST7735::BLACK);
 
 /* 中文 (UTF-8) */
-ST7735_WriteStringUTF8(20, 40, "\xE4\xBD\xA0\xE5\xA5\xBD",
-                       Font_Subset_ZH_16x16, ST7735::YELLOW, ST7735::BLACK);
+g_lcd.writeStringUtf8(20, 40, "\xE4\xBD\xA0\xE5\xA5\xBD",
+                      Font_Subset_ZH_16x16, ST7735::YELLOW, ST7735::BLACK);
 
 /* 格式化 */
-ST7735_Print(2, 20, Font_Subset_7x10, ST7735::GREEN, ST7735::BLACK,
-             "%u mA", current);
+g_lcd.print(2, 20, Font_Subset_7x10, ST7735::GREEN, ST7735::BLACK,
+            "%u mA", current);
 
 /* 图形 */
-ST7735_DrawRect(0, 0, 160, 80, ST7735::CYAN);
-ST7735_FillCircle(80, 40, 20, ST7735::RED);
-ST7735_DrawLine(0, 0, 159, 79, ST7735::WHITE);
+g_lcd.drawRect(0, 0, 160, 80, ST7735::CYAN);
+g_lcd.fillCircle(80, 40, 20, ST7735::RED);
+g_lcd.drawLine(0, 0, 159, 79, ST7735::WHITE);
 
-/* 运行时换方向 */
-ST7735_SetRotation(ST7735::DEG_90);
+/* 运行时换方向 / 换面板 */
+g_lcd.setRotation(ST7735::DEG_90);
+g_lcd.selectPanel(1);   /* B → 随后 g_lcd.init() 才生效 */
 ```
 
 ---
 
 ## 6. API 一览
 
-| 分类 | 函数 |
-|------|------|
-| 初始化 | `ST7735_Init()` |
-| **面板自检** | `ST7735_PanelSelfTest(delayMs)` |
-| 基础绘制 | `DrawPixel` `FillRectangle` `FillScreen` `DrawImage` |
-| DMA 加速 | `FillRectangle_DMA` `FillScreen_DMA` `DrawImage_DMA` |
-| 文本 | `WriteChar` `WriteString` `WriteStringUTF8` `Print` |
-| 显示控制 | `InvertColors` `SetGamma` `DisplayOn` `DisplayOff` `SetBacklight` |
-| 旋转 | `SetRotation` `GetRotation` `GetWidth` `GetHeight` |
-| 图形原语 | `DrawHLine` `DrawVLine` `DrawRect` `DrawRoundRect` `FillRoundRect` `DrawLine` `DrawCircle` `FillCircle` `DrawTriangle` `FillTriangle` |
+| 分类 | 成员函数 |
+|------|----------|
+| 初始化 | `init(spi, dma, pins, panelIdx)` · `isInitialized()` |
+| **面板自检** | `panelSelfTest(delayMs)` |
+| 基础绘制 | `drawPixel` `fillRectangle` `fillScreen` `drawImage` |
+| DMA 加速 | `fillRectangleDma` `fillScreenDma` `drawImageDma` |
+| 文本 | `writeChar` `writeString` `writeStringUtf8` `print` |
+| 显示控制 | `invertColors` `setGamma` `displayOn` `displayOff` `setBacklight` |
+| 旋转 | `setRotation` `getRotation` `getWidth` `getHeight` |
+| 面板 | `selectPanel` `getPanelIndex` `getPanelName` |
+| 图形原语 | `drawHLine` `drawVLine` `drawRect` `drawRoundRect` `fillRoundRect` `drawLine` `drawCircle` `fillCircle` `drawTriangle` `fillTriangle` |
 
-**颜色**：`BLACK / BLUE / RED / GREEN / CYAN / MAGENTA / YELLOW / WHITE / ORANGE / GRAY`
-以及 `constexpr Color565(r,g,b)`（可作编译期常量）。
+**颜色**：`ST7735::BLACK / BLUE / RED / GREEN / CYAN / MAGENTA / YELLOW / WHITE /
+ORANGE / GRAY`，以及 `constexpr ST7735::Color565(r,g,b)`（可作编译期常量）。
+写法与旧版完全一致（全局别名保证）。
 
-**面板批次（运行时可切）**：`ST7735_SelectPanel(0..3)` 切 A/B/C/D、
-`ST7735_GetPanelIndex()`、`ST7735_GetPanelName()`（"PanelA".."PanelD"）。
-四套参数内置 `st7735.cpp` 的 `kPanels[4]`；上电默认批次由
-`lf_config.h` 的 `ST7735_PANEL_A/B/C/D` 决定（映射 `ST7735_DEFAULT_PANEL_IDX`）。
-切换后须重调 `ST7735_Init()` 才生效。
+**面板批次（运行时可切）**：`selectPanel(0..3)` 切 A/B/C/D、`getPanelIndex()`、
+`getPanelName()`（"PanelA".."PanelD"）。四套参数内置 `st7735.cpp` 的
+`kPanels[4]`（只读，所有实例共享）；上电默认批次由 `lf_config.h` 的
+`ST7735_PANEL_A/B/C/D` 决定（映射 `ST7735_DEFAULT_PANEL_IDX`）。
+切换后须重调 `init()` 才生效。
+
+**旧 API → 新 API 对照**（迁移时逐条替换）：
+
+| 旧（已删除） | 新 |
+|---|---|
+| `ST7735_Init()` | `lcd.init()` |
+| `ST7735_FillScreen(c)` | `lcd.fillScreen(c)` |
+| `ST7735_FillRectangle_DMA(...)` | `lcd.fillRectangleDma(...)` |
+| `ST7735_DrawImage_DMA(...)` | `lcd.drawImageDma(...)` |
+| `ST7735_WriteString(...)` | `lcd.writeString(...)` |
+| `ST7735_DrawPixel(...)` | `lcd.drawPixel(...)` |
+| `ST7735_SetBacklight(b)` | `lcd.setBacklight(b)` |
+| `ST7735_SelectPanel(n)` | `lcd.selectPanel(n)` |
 
 ---
 
 ## 7. 初始化时序（与参考工程一致）
 
 ```
-select → reset(低5ms→高) → cmds1 → MADCTL → cmds2 → cmds3 → INVON/INVOFF → deselect
+select → reset(低120ms→高120ms) → cmds1 → MADCTL → cmds2 → cmds3 → INVON/INVOFF → deselect
 ```
 
-注意 **MADCTL 必须在 cmds1 之后、cmds2 之前**发送——
-这是 `LoveFinder491_PowerOneT2` 与 `stm32-st7735` 的共同顺序，
-cmds1 内部的 `INVOFF` 不会覆盖 MADCTL。
+- **MADCTL 必须在 cmds1 之后、cmds2 之前**发送——这是
+  `LoveFinder491_PowerOneT2` 与 `stm32-st7735` 的共同顺序，
+  cmds1 内部的 `INVOFF` 不会覆盖 MADCTL。
+- 复位低/高电平各 **120ms**：早期版本用 5ms，复位不彻底 → 旧 GRAM 残留，
+  切换配置时新旧文字重叠（现象像「清屏不生效」）。
 
 ---
 
 ## 8. 实现说明
 
-- **DMA 路径**：ST7735 是 16-bit 像素而 DMA 按 byte 传输，因此先用
-  `static uint8_t g_rowBuf[ST7735_WIDTH * 2]` 行缓冲把 RGB565 展开成大端
-  字节流，再分块交给 DMA。DMA 失败自动退回轮询，功能不丢。
-  > 行缓冲是 `static`，**非线程安全**，且要求 `ST7735_WIDTH` 编译期已知。
+- **状态全部是成员**：`m_rotation` / `m_width` / `m_height` / `m_xStart` /
+  `m_yStart` / `m_panelIdx` / `m_initialized` / 硬件句柄与引脚。
+  只读的面板表与初始化命令表放在匿名 namespace，**所有实例共享**。
+  （旧版是文件级 `g_*` 全局 —— 两块屏会互相覆盖旋转/窗口状态。）
+- **DMA 路径**：ST7735 是 16-bit 像素而 DMA 按 byte 传输，因此用
+  `m_rowBuf[ST7735_WIDTH * 2]` 行缓冲把 RGB565 展开成大端字节流，
+  再分块交给 DMA。DMA 失败自动退回轮询，功能不丢。
+  > 行缓冲是**每实例一份**（160 宽 = 320 B RAM），同一实例非线程安全；
+  > 要求 `ST7735_WIDTH` 编译期已知。
 - **轮询路径**：`spiWriteByte` 等 `TDBE` 置位后写数据寄存器，
   `spiWaitIdle` 等 `BF` 清零，切换 DC/CS 前确保移位完成——
   这是阻塞模式能稳定点亮的关键。
-- `ST7735_USE_DMA=0` 时，`*_DMA` 函数直接退化为对应轮询版本。
+- **分块填充**：实测本面板「单个地址窗口 >48x12 必花屏」，
+  `fillRectangle` 内部把大矩形切成 48x12 小块，每块独立
+  CS→设小窗口→发数据→CS（详见源码证据链注释）。
+- `ST7735_USE_DMA=0` 时，`*Dma` 函数直接退化为对应轮询版本。
 
 ---
 

@@ -14,39 +14,33 @@
  *      select → reset → cmds1 → MADCTL → cmds2 → cmds3 → INVON/INVOFF → deselect
  *
  *  硬件访问【直调 AT32 BSP】(仿 LoveFinderLibForPY32_LL 直调 LL_*):
- *    SPI  = ST7735_SPI  GPIO = ST7735_*_PORT/PIN  DMA = ST7735_DMA_CHANNEL
+ *    SPI = m_spi   GPIO = m_csPort/m_dcPort/m_resPort/m_enPort   DMA = m_dma
  *    延时 = wk_delay_ms (WorkBench)   时基 = lf_get_tick (工程 lf_irq.cpp)
- *  外设/引脚宏全部来自工程 lf_config.h, 库内无平台抽象层。
+ *  三者全部由 init() 绑定, 不传形参时取 lf_config.h 的 ST7735_* 宏。
+ *
+ *  ★ 本文件是【类成员实现】(原 60 个 extern "C" 全局函数已删除, API 只有
+ *    实例方法一套)。只读的面板表 / 初始化命令表放在匿名 namespace 供所有
+ *    实例共享; 可变状态 (旋转参数 / 面板索引 / 硬件句柄) 全是成员。
  */
 #include "st7735.hpp"
 #include "font.h"
 
 #include <cmath>
 
+namespace LoveFinderLib {
+
 namespace {
 
 /*============================================================================
- * 状态
- *
- * 外设与引脚直接用 lf_config.h 的宏 (ST7735_SPI / ST7735_*_PORT/PIN),
- * 不再持有任何平台层对象。
+ * 只读常量 — 所有实例共享 (面板表 + 初始化命令表)
  *============================================================================*/
-bool g_initialized = false;
-
 constexpr uint8_t DELAY = 0x80;
-
-/* 当前旋转档位与其对应参数 */
-uint8_t  g_rotation = ST7735_ROTATION;
-uint16_t g_width    = ST7735::WIDTH;
-uint16_t g_height   = ST7735::HEIGHT;
-uint16_t g_xStart   = 0;   /* 由 applyRotation (Init 内) 按面板表设置 */
-uint16_t g_yStart   = 0;
 
 /*============================================================================
  * 运行时面板批次表 —— A/B/C/D 四套参数全部内置, 可运行期切换
  *
  * 默认批次由 lf_config.h 的 ST7735_PANEL_A/B/C/D 决定 (ST7735_DEFAULT_PANEL_IDX);
- * 点屏排障时用 ST7735_SelectPanel(0..3) 切换, 再重调 ST7735_Init() 即生效。
+ * 点屏排障时用 selectPanel(0..3) 切换, 再重调 init() 即生效。
  *============================================================================*/
 struct PanelCfg {
     const char *name;      /* "PanelA".."PanelD" */
@@ -82,139 +76,6 @@ const PanelCfg kPanels[4] = {
         uint8_t(ST7735_MADCTL_MY | ST7735_MADCTL_MV | ST7735_MADCTL_BGR),
         uint8_t(ST7735_MADCTL_BGR) } },
 };
-
-/** 当前面板批次 (0..3), 上电取 lf_config.h 的默认值。 */
-uint8_t g_panelIdx = ST7735_DEFAULT_PANEL_IDX;
-
-/*============================================================================
- * 面板参数查询
- *
- * DEG_0 / DEG_180 为横屏 (W x H), DEG_90 / DEG_270 为竖屏 (H x W)。
- * 偏移按 491 的约定: 竖屏时 X/Y 偏移互换。
- *============================================================================*/
-struct RotationCfg {
-    uint8_t  madctl;
-    uint16_t width;
-    uint16_t height;
-    uint16_t xStart;
-    uint16_t yStart;
-};
-
-[[nodiscard]] RotationCfg rotationCfgOf(uint8_t rot) noexcept
-{
-    const PanelCfg &p = kPanels[g_panelIdx];
-    switch (rot) {
-    case ST7735::DEG_90:
-        return { p.madctl[ST7735::DEG_90], ST7735::HEIGHT, ST7735::WIDTH,
-                 p.yoff, p.xoff };
-    case ST7735::DEG_180:
-        return { p.madctl[ST7735::DEG_180], ST7735::WIDTH, ST7735::HEIGHT,
-                 p.xoff, p.yoff };
-    case ST7735::DEG_270:
-        return { p.madctl[ST7735::DEG_270], ST7735::HEIGHT, ST7735::WIDTH,
-                 p.yoff, p.xoff };
-    case ST7735::DEG_0:
-    default:
-        return { p.madctl[ST7735::DEG_0], ST7735::WIDTH, ST7735::HEIGHT,
-                 p.xoff, p.yoff };
-    }
-}
-
-void applyRotation(uint8_t rot) noexcept
-{
-    const RotationCfg cfg = rotationCfgOf(rot);
-    g_rotation = rot;
-    g_width    = cfg.width;
-    g_height   = cfg.height;
-    g_xStart   = cfg.xStart;
-    g_yStart   = cfg.yStart;
-}
-
-/*============================================================================
- * 底层原语 — 直调 AT32 BSP (对应 PY32 库直调 LL_SPI_ / LL_GPIO_ 系列)
- *============================================================================*/
-void csLow()  { gpio_bits_reset(ST7735_CS_PORT, ST7735_CS_PIN); }
-void csHigh() { gpio_bits_set(ST7735_CS_PORT, ST7735_CS_PIN); }
-
-void dcCommand() { gpio_bits_reset(ST7735_DC_PORT, ST7735_DC_PIN); }
-void dcData()    { gpio_bits_set(ST7735_DC_PORT, ST7735_DC_PIN); }
-
-/** 阻塞写一个字节: 等 TDBE → 写数据寄存器。 */
-void spiWriteByte(uint8_t b)
-{
-    while (spi_i2s_flag_get(ST7735_SPI, SPI_I2S_TDBE_FLAG) == RESET) {
-        /* busy wait —— 前提: wk_spi1_init() 已完成, SPI 时钟已开 */
-    }
-    spi_i2s_data_transmit(ST7735_SPI, b);
-}
-
-/** 等 SPI 移位寄存器彻底空 —— 翻 CS 前必须等, 否则截断最后一字节。 */
-void spiWaitIdle()
-{
-    while (spi_i2s_flag_get(ST7735_SPI, SPI_I2S_BF_FLAG) != RESET) {
-        /* busy wait */
-    }
-}
-
-void spiWriteBlock(const uint8_t *data, uint16_t len)
-{
-    for (uint16_t i = 0; i < len; ++i) {
-        spiWriteByte(data[i]);
-    }
-    spiWaitIdle();
-}
-
-void writeCommand(uint8_t cmd)
-{
-    dcCommand();
-    spiWriteByte(cmd);
-    spiWaitIdle();
-}
-
-void writeData(const uint8_t *buff, std::size_t size)
-{
-    if (buff == nullptr || size == 0u) return;
-    dcData();
-    spiWriteBlock(buff, static_cast<uint16_t>(size));
-}
-
-void writeData8(uint8_t v) { writeData(&v, 1u); }
-
-/** 发送 16-bit 像素数组 (大端)。 */
-void writeData16(const uint16_t *buff, std::size_t count)
-{
-    if (buff == nullptr) return;
-    dcData();
-    for (std::size_t i = 0; i < count; ++i) {
-        spiWriteByte(static_cast<uint8_t>(buff[i] >> 8));
-        spiWriteByte(static_cast<uint8_t>(buff[i] & 0xFFu));
-    }
-    spiWaitIdle();
-}
-
-/*============================================================================
- * 设置绘图窗口 (含面板偏移)
- *============================================================================*/
-void setAddressWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
-{
-    uint8_t data[4];
-
-    writeCommand(ST7735::CASET);
-    data[0] = static_cast<uint8_t>((x0 + g_xStart) >> 8);
-    data[1] = static_cast<uint8_t>((x0 + g_xStart) & 0xFFu);
-    data[2] = static_cast<uint8_t>((x1 + g_xStart) >> 8);
-    data[3] = static_cast<uint8_t>((x1 + g_xStart) & 0xFFu);
-    writeData(data, 4u);
-
-    writeCommand(ST7735::RASET);
-    data[0] = static_cast<uint8_t>((y0 + g_yStart) >> 8);
-    data[1] = static_cast<uint8_t>((y0 + g_yStart) & 0xFFu);
-    data[2] = static_cast<uint8_t>((y1 + g_yStart) >> 8);
-    data[3] = static_cast<uint8_t>((y1 + g_yStart) & 0xFFu);
-    writeData(data, 4u);
-
-    writeCommand(ST7735::RAMWR);
-}
 
 /*============================================================================
  * 初始化命令表 —— 逐条对照 LoveFinder491 / stm32-st7735
@@ -256,7 +117,122 @@ const uint8_t initCmds3[] = {
     ST7735::DISPON, DELAY, 100
 };
 
-void executeCommandList(const uint8_t *addr)
+} // namespace
+
+/*============================================================================
+ * 旋转参数 — 按当前面板批次给出 MADCTL / 尺寸 / GRAM 偏移
+ *
+ * DEG_0 / DEG_180 为横屏 (W x H), DEG_90 / DEG_270 为竖屏 (H x W)。
+ * 偏移按 491 的约定: 竖屏时 X/Y 偏移互换。
+ *============================================================================*/
+ST7735::RotationCfg ST7735::rotationCfgOf(uint8_t rot) const noexcept
+{
+    const PanelCfg &p = kPanels[m_panelIdx];
+    switch (rot) {
+    case ST7735::DEG_90:
+        return { p.madctl[ST7735::DEG_90], ST7735::HEIGHT, ST7735::WIDTH,
+                 p.yoff, p.xoff };
+    case ST7735::DEG_180:
+        return { p.madctl[ST7735::DEG_180], ST7735::WIDTH, ST7735::HEIGHT,
+                 p.xoff, p.yoff };
+    case ST7735::DEG_270:
+        return { p.madctl[ST7735::DEG_270], ST7735::HEIGHT, ST7735::WIDTH,
+                 p.yoff, p.xoff };
+    case ST7735::DEG_0:
+    default:
+        return { p.madctl[ST7735::DEG_0], ST7735::WIDTH, ST7735::HEIGHT,
+                 p.xoff, p.yoff };
+    }
+}
+
+void ST7735::applyRotation(uint8_t rot) noexcept
+{
+    const RotationCfg cfg = rotationCfgOf(rot);
+    m_rotation = rot;
+    m_width    = cfg.width;
+    m_height   = cfg.height;
+    m_xStart   = cfg.xStart;
+    m_yStart   = cfg.yStart;
+}
+
+/*============================================================================
+ * 底层原语 — 直调 AT32 BSP (对应 PY32 库直调 LL_SPI_ / LL_GPIO_ 系列)
+ *============================================================================*/
+void ST7735::spiWriteByte(uint8_t b) noexcept
+{
+    while (spi_i2s_flag_get(m_spi, SPI_I2S_TDBE_FLAG) == RESET) {
+        /* busy wait —— 前提: wk_spi1_init() 已完成, SPI 时钟已开 */
+    }
+    spi_i2s_data_transmit(m_spi, b);
+}
+
+/** 等 SPI 移位寄存器彻底空 —— 翻 CS 前必须等, 否则截断最后一字节。 */
+void ST7735::spiWaitIdle() noexcept
+{
+    while (spi_i2s_flag_get(m_spi, SPI_I2S_BF_FLAG) != RESET) {
+        /* busy wait */
+    }
+}
+
+void ST7735::spiWriteBlock(const uint8_t *data, uint16_t len) noexcept
+{
+    for (uint16_t i = 0; i < len; ++i) {
+        spiWriteByte(data[i]);
+    }
+    spiWaitIdle();
+}
+
+void ST7735::writeCommand(uint8_t cmd) noexcept
+{
+    dcCommand();
+    spiWriteByte(cmd);
+    spiWaitIdle();
+}
+
+void ST7735::writeData(const uint8_t *buff, std::size_t size) noexcept
+{
+    if (buff == nullptr || size == 0u) return;
+    dcData();
+    spiWriteBlock(buff, static_cast<uint16_t>(size));
+}
+
+/** 发送 16-bit 像素数组 (大端)。 */
+void ST7735::writeData16(const uint16_t *buff, std::size_t count) noexcept
+{
+    if (buff == nullptr) return;
+    dcData();
+    for (std::size_t i = 0; i < count; ++i) {
+        spiWriteByte(static_cast<uint8_t>(buff[i] >> 8));
+        spiWriteByte(static_cast<uint8_t>(buff[i] & 0xFFu));
+    }
+    spiWaitIdle();
+}
+
+/*============================================================================
+ * 设置绘图窗口 (含面板偏移)
+ *============================================================================*/
+void ST7735::setAddressWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) noexcept
+{
+    uint8_t data[4];
+
+    writeCommand(ST7735::CASET);
+    data[0] = static_cast<uint8_t>((x0 + m_xStart) >> 8);
+    data[1] = static_cast<uint8_t>((x0 + m_xStart) & 0xFFu);
+    data[2] = static_cast<uint8_t>((x1 + m_xStart) >> 8);
+    data[3] = static_cast<uint8_t>((x1 + m_xStart) & 0xFFu);
+    writeData(data, 4u);
+
+    writeCommand(ST7735::RASET);
+    data[0] = static_cast<uint8_t>((y0 + m_yStart) >> 8);
+    data[1] = static_cast<uint8_t>((y0 + m_yStart) & 0xFFu);
+    data[2] = static_cast<uint8_t>((y1 + m_yStart) >> 8);
+    data[3] = static_cast<uint8_t>((y1 + m_yStart) & 0xFFu);
+    writeData(data, 4u);
+
+    writeCommand(ST7735::RAMWR);
+}
+
+void ST7735::executeCommandList(const uint8_t *addr) noexcept
 {
     uint8_t numCommands = *addr++;
     while (numCommands-- != 0u) {
@@ -286,26 +262,27 @@ void executeCommandList(const uint8_t *addr)
     }
 }
 
-void resetPanel()
+void ST7735::resetPanel() noexcept
 {
-    gpio_bits_reset(ST7735_RES_PORT, ST7735_RES_PIN);
+    gpio_bits_reset(m_resPort, m_resPin);
     /* RES 低电平脉宽 —— 之前 5ms 太短, 复位不彻底 -> 屏没被真正复位,
      * 旧 GRAM 内容残留 -> 切换配置时新旧文字重叠 (清屏"不生效")。
      * 按实测要求改为 120ms (>=100ms), 保证复位可靠、显存回到已知状态。 */
     wk_delay_ms(120);
-    gpio_bits_set(ST7735_RES_PORT, ST7735_RES_PIN);
+    gpio_bits_set(m_resPort, m_resPin);
     wk_delay_ms(120);
 }
 
 /*============================================================================
  * 控制引脚初始化 — 把 CS/DC/RES 配成推挽输出并置初始电平
- * (仿 PY32: 驱动自己配置控制脚, 外设实例来自工程 lf_config.h)
+ * (仿 PY32: 驱动自己配置控制脚)
+ *
+ * ⚠ 逐实例一次 (原来是文件级 static, 多实例共用会漏配第二块屏的引脚)。
  *============================================================================*/
-void ensurePins()
+void ST7735::ensurePins() noexcept
 {
-    static bool s_pinsCfgured = false;
-    if (s_pinsCfgured) return;
-    s_pinsCfgured = true;
+    if (m_pinsCfgured) return;
+    m_pinsCfgured = true;
 
     gpio_init_type cfg;
     gpio_default_para_init(&cfg);
@@ -314,56 +291,91 @@ void ensurePins()
     cfg.gpio_pull           = GPIO_PULL_NONE;
     cfg.gpio_drive_strength = GPIO_DRIVE_STRENGTH_MODERATE;
 
-    cfg.gpio_pins = ST7735_CS_PIN;
-    gpio_init(ST7735_CS_PORT, &cfg);
-    gpio_bits_set(ST7735_CS_PORT, ST7735_CS_PIN);
+    cfg.gpio_pins = m_csPin;
+    gpio_init(m_csPort, &cfg);
+    gpio_bits_set(m_csPort, m_csPin);
 
-    cfg.gpio_pins = ST7735_DC_PIN;
-    gpio_init(ST7735_DC_PORT, &cfg);
-    gpio_bits_set(ST7735_DC_PORT, ST7735_DC_PIN);
+    cfg.gpio_pins = m_dcPin;
+    gpio_init(m_dcPort, &cfg);
+    gpio_bits_set(m_dcPort, m_dcPin);
 
-    cfg.gpio_pins = ST7735_RES_PIN;
-    gpio_init(ST7735_RES_PORT, &cfg);
-    gpio_bits_set(ST7735_RES_PORT, ST7735_RES_PIN);
+    cfg.gpio_pins = m_resPin;
+    gpio_init(m_resPort, &cfg);
+    gpio_bits_set(m_resPort, m_resPin);
 }
 
 /** 像素坐标裁剪: 返回 false 表示完全在屏幕外。 */
-bool clipRect(uint16_t &x, uint16_t &y, uint16_t &w, uint16_t &h)
+bool ST7735::clipRect(uint16_t &x, uint16_t &y, uint16_t &w, uint16_t &h) const noexcept
 {
     if (w == 0u || h == 0u) return false;
-    if (x >= g_width || y >= g_height) return false;
+    if (x >= m_width || y >= m_height) return false;
 
-    if (static_cast<uint32_t>(x) + w > g_width) {
-        w = static_cast<uint16_t>(g_width - x);
+    if (static_cast<uint32_t>(x) + w > m_width) {
+        w = static_cast<uint16_t>(m_width - x);
     }
-    if (static_cast<uint32_t>(y) + h > g_height) {
-        h = static_cast<uint16_t>(g_height - y);
+    if (static_cast<uint32_t>(y) + h > m_height) {
+        h = static_cast<uint16_t>(m_height - y);
     }
     return true;
 }
 
 /** 绘制单个字形 (data 为 height 个 uint16_t, bit15 = 最左列)。 */
-void drawGlyph(uint16_t x, uint16_t y, const uint16_t *glyph,
-               uint8_t width, uint8_t height, uint16_t color, uint16_t bgcolor)
+void ST7735::drawGlyph(uint16_t x, uint16_t y, const uint16_t *glyph,
+                       uint8_t width, uint8_t height, uint16_t color, uint16_t bgcolor) noexcept
 {
     for (uint8_t row = 0; row < height; ++row) {
         const uint16_t bits = glyph[row];
         for (uint8_t col = 0; col < width; ++col) {
             const bool on = (bits & static_cast<uint16_t>(0x8000u >> col)) != 0u;
-            ST7735_DrawPixel(static_cast<uint16_t>(x + col),
-                             static_cast<uint16_t>(y + row),
-                             on ? color : bgcolor);
+            drawPixel(static_cast<uint16_t>(x + col),
+                      static_cast<uint16_t>(y + row),
+                      on ? color : bgcolor);
         }
     }
 }
 
-} // namespace
-
 /*============================================================================
- * 初始化
+ * 初始化 — 绑定硬件 + 下发屏初始化序列
  *============================================================================*/
-extern "C" void ST7735_Init()
+void ST7735::init(spi_type *spi, dma_channel_type *dma,
+                  const PinSet &pins, uint8_t panelIdx) noexcept
 {
+    /*--------------------------------------------------------------------
+     * 硬件绑定: 形参不给就用 lf_config.h 的宏 (与旧 ST7735_Init 一致)
+     *--------------------------------------------------------------------*/
+    if (spi != nullptr) m_spi = spi;
+
+#if (ST7735_USE_DMA == 1)
+    m_dma = (dma != nullptr) ? dma : static_cast<dma_channel_type *>(ST7735_DMA_CHANNEL);
+#else
+    (void)dma;
+#endif
+
+    if (pins.csPort != nullptr) { m_csPort = pins.csPort;  m_csPin  = pins.csPin;  }
+    else                        { m_csPort = static_cast<gpio_type *>(ST7735_CS_PORT);
+                                  m_csPin  = static_cast<uint16_t>(ST7735_CS_PIN);  }
+
+    if (pins.dcPort != nullptr) { m_dcPort = pins.dcPort;  m_dcPin  = pins.dcPin;  }
+    else                        { m_dcPort = static_cast<gpio_type *>(ST7735_DC_PORT);
+                                  m_dcPin  = static_cast<uint16_t>(ST7735_DC_PIN);  }
+
+    if (pins.resPort != nullptr){ m_resPort = pins.resPort; m_resPin = pins.resPin; }
+    else                        { m_resPort = static_cast<gpio_type *>(ST7735_RES_PORT);
+                                  m_resPin  = static_cast<uint16_t>(ST7735_RES_PIN); }
+
+#ifdef ST7735_EN_PORT
+    if (pins.enPort != nullptr) { m_enPort = pins.enPort;  m_enPin  = pins.enPin;  }
+    else                        { m_enPort = static_cast<gpio_type *>(ST7735_EN_PORT);
+                                  m_enPin  = static_cast<uint16_t>(ST7735_EN_PIN);  }
+#else
+    (void)pins;
+#endif
+
+    m_panelIdx = panelIdx;
+
+    /*--------------------------------------------------------------------
+     * 屏初始化序列 (与 491 的 begin() 一致)
+     *--------------------------------------------------------------------*/
     ensurePins();
     applyRotation(ST7735_ROTATION);
 
@@ -379,120 +391,110 @@ extern "C" void ST7735_Init()
 
     /* MADCTL —— 必须在 cmds1 之后、cmds2 之前 (与 491 begin() 一致) */
     writeCommand(ST7735::MADCTL);
-    writeData8(rotationCfgOf(g_rotation).madctl);
+    writeData8(rotationCfgOf(m_rotation).madctl);
 
     /* cmds2 / cmds3 */
     executeCommandList(initCmds2);
     executeCommandList(initCmds3);
 
     /* 面板反色极性 */
-    writeCommand(kPanels[g_panelIdx].invert ? ST7735::INVON : ST7735::INVOFF);
+    writeCommand(kPanels[m_panelIdx].invert ? ST7735::INVON : ST7735::INVOFF);
     csHigh();
 
-    g_initialized = true;
+    m_initialized = true;
 }
 
 /*============================================================================
  * 面板自检 —— 点屏排查
  *============================================================================*/
-extern "C" void ST7735_PanelSelfTest(uint16_t delayMs)
+void ST7735::panelSelfTest(uint16_t delayMs) noexcept
 {
-    if (!g_initialized) return;
+    if (!m_initialized) return;
 
-    ST7735_FillScreen(ST7735::RED);
+    fillScreen(ST7735::RED);
     wk_delay_ms(delayMs);
 
-    ST7735_FillScreen(ST7735::GREEN);
+    fillScreen(ST7735::GREEN);
     wk_delay_ms(delayMs);
 
-    ST7735_FillScreen(ST7735::BLUE);
+    fillScreen(ST7735::BLUE);
     wk_delay_ms(delayMs);
 
-    ST7735_FillScreen(ST7735::WHITE);
+    fillScreen(ST7735::WHITE);
     wk_delay_ms(delayMs);
 
-    ST7735_FillScreen(ST7735::BLACK);
+    fillScreen(ST7735::BLACK);
 }
 
 /*============================================================================
  * 显示控制
  *============================================================================*/
-extern "C" void ST7735_DisplayOn()  { writeCommand(ST7735::DISPON); }
-extern "C" void ST7735_DisplayOff() { writeCommand(ST7735::DISPOFF); }
-
-extern "C" void ST7735_InvertColors(bool invert)
+void ST7735::invertColors(bool invert) noexcept
 {
     writeCommand(invert ? ST7735::INVON : ST7735::INVOFF);
 }
 
-extern "C" void ST7735_SetGamma(GammaDef gamma)
+void ST7735::setGamma(GammaDef gamma) noexcept
 {
     writeCommand(ST7735::GAMSET);
     writeData8(static_cast<uint8_t>(gamma));
 }
 
-/** 背光 (可选; 需在 lf_config.h 中定义 ST7735_EN_PORT/PIN)。 */
-extern "C" void ST7735_SetBacklight(bool on)
+/** 背光 (可选; 引脚由 init 的 PinSet 或 lf_config.h 的 ST7735_EN_* 提供)。 */
+void ST7735::setBacklight(bool on) noexcept
 {
-#ifdef ST7735_EN_PORT
+    if (m_enPort == nullptr) return;
+
     gpio_init_type cfg;
     gpio_default_para_init(&cfg);
-    cfg.gpio_pins           = ST7735_EN_PIN;
+    cfg.gpio_pins           = m_enPin;
     cfg.gpio_mode           = GPIO_MODE_OUTPUT;
     cfg.gpio_out_type       = GPIO_OUTPUT_PUSH_PULL;
     cfg.gpio_pull           = GPIO_PULL_NONE;
     cfg.gpio_drive_strength = GPIO_DRIVE_STRENGTH_MODERATE;
-    gpio_init(ST7735_EN_PORT, &cfg);
-    gpio_bits_write(ST7735_EN_PORT, ST7735_EN_PIN, on ? TRUE : FALSE);
-#else
-    (void)on;
-#endif
+    gpio_init(m_enPort, &cfg);
+    gpio_bits_write(m_enPort, m_enPin, on ? TRUE : FALSE);
 }
 
 /*============================================================================
- * 旋转
+ * 旋转 / 面板批次
  *============================================================================*/
-extern "C" void ST7735_SetRotation(uint8_t rotation)
+void ST7735::setRotation(uint8_t rotation) noexcept
 {
     if (rotation > ST7735::DEG_270) return;
 
     applyRotation(rotation);
 
-    if (!g_initialized) return;
+    if (!m_initialized) return;
 
     csLow();
     writeCommand(ST7735::MADCTL);
-    writeData8(rotationCfgOf(g_rotation).madctl);
+    writeData8(rotationCfgOf(m_rotation).madctl);
     /* 重置整屏窗口到新尺寸 */
-    setAddressWindow(0, 0, static_cast<uint16_t>(g_width - 1u),
-                            static_cast<uint16_t>(g_height - 1u));
+    setAddressWindow(0, 0, static_cast<uint16_t>(m_width - 1u),
+                            static_cast<uint16_t>(m_height - 1u));
     csHigh();
 }
 
-extern "C" uint8_t  ST7735_GetRotation() { return g_rotation; }
-extern "C" uint16_t ST7735_GetWidth()    { return g_width; }
-extern "C" uint16_t ST7735_GetHeight()   { return g_height; }
-
-/*============================================================================
- * 面板批次 — 运行时切换 (点屏排障: 不重编译逐套对比 A/B/C/D)
- *============================================================================*/
-extern "C" void ST7735_SelectPanel(uint8_t idx)
+void ST7735::selectPanel(uint8_t idx) noexcept
 {
     if (idx >= 4u) idx = 0u;
-    g_panelIdx    = idx;
-    g_initialized = false;   /* 下次 ST7735_Init() 才按新面板重下发初始化 */
+    m_panelIdx    = idx;
+    m_initialized = false;   /* 下次 init() 才按新面板重下发初始化 */
 }
 
-extern "C" uint8_t ST7735_GetPanelIndex() { return g_panelIdx; }
+const char* ST7735::getPanelName() const noexcept
+{
+    return kPanels[m_panelIdx].name;
+}
 
-extern "C" const char* ST7735_GetPanelName() { return kPanels[g_panelIdx].name; }
 /*============================================================================
  * 基础绘制
  *============================================================================*/
-extern "C" void ST7735_DrawPixel(uint16_t x, uint16_t y, uint16_t color)
+void ST7735::drawPixel(uint16_t x, uint16_t y, uint16_t color) noexcept
 {
-    if (!g_initialized) return;
-    if (x >= g_width || y >= g_height) return;
+    if (!m_initialized) return;
+    if (x >= m_width || y >= m_height) return;
 
     csLow();
     setAddressWindow(x, y, x, y);
@@ -503,9 +505,9 @@ extern "C" void ST7735_DrawPixel(uint16_t x, uint16_t y, uint16_t color)
     csHigh();
 }
 
-extern "C" void ST7735_FillRectangle(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
+void ST7735::fillRectangle(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) noexcept
 {
-    if (!g_initialized) return;
+    if (!m_initialized) return;
     if (!clipRect(x, y, w, h)) return;
 
     const uint8_t hi = static_cast<uint8_t>(color >> 8);
@@ -554,14 +556,15 @@ extern "C" void ST7735_FillRectangle(uint16_t x, uint16_t y, uint16_t w, uint16_
     }
 }
 
-extern "C" void ST7735_FillScreen(uint16_t color)
+void ST7735::fillScreen(uint16_t color) noexcept
 {
-    ST7735_FillRectangle(0, 0, g_width, g_height, color);
+    fillRectangle(0, 0, m_width, m_height, color);
 }
 
-extern "C" void ST7735_DrawImage(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_t *data)
+void ST7735::drawImage(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                       const uint16_t *data) noexcept
 {
-    if (!g_initialized || data == nullptr) return;
+    if (!m_initialized || data == nullptr) return;
     if (!clipRect(x, y, w, h)) return;
 
     csLow();
@@ -576,12 +579,6 @@ extern "C" void ST7735_DrawImage(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
  * ST7735 是 16-bit 像素, 而 DMA 按 byte 传输, 因此先用行缓冲把 RGB565
  * 展开成大端字节流, 再分块交给 DMA。DMA 失败自动退回轮询。
  *============================================================================*/
-namespace {
-#if (ST7735_USE_DMA == 1)
-constexpr uint16_t kRowBufPixels = ST7735_WIDTH;
-alignas(4) uint8_t g_rowBuf[kRowBufPixels * 2u];
-#endif // ST7735_USE_DMA
-
 #if (ST7735_USE_DMA == 1)
 /**
  * @brief 阻塞式 DMA 发送 — 轮询通道剩余计数 + SPI 忙标志 (不依赖中断)。
@@ -592,40 +589,39 @@ alignas(4) uint8_t g_rowBuf[kRowBufPixels * 2u];
  *   3) 等 SPI BF 清零 (移位寄存器发完最后字节)
  * 超时则关通道返回 false, 上层退回轮询发送。
  */
-bool dmaTransfer(const uint8_t *data, uint16_t len, uint32_t timeoutMs)
+bool ST7735::dmaTransfer(const uint8_t *data, uint16_t len, uint32_t timeoutMs) noexcept
 {
-    if (data == nullptr || len == 0u) return false;
+    if (data == nullptr || len == 0u || m_dma == nullptr) return false;
 
-    dma_channel_enable(ST7735_DMA_CHANNEL, FALSE);
-    ST7735_DMA_CHANNEL->dtcnt = len;
-    ST7735_DMA_CHANNEL->maddr = reinterpret_cast<uint32_t>(data);
-    dma_channel_enable(ST7735_DMA_CHANNEL, TRUE);
+    dma_channel_enable(m_dma, FALSE);
+    m_dma->dtcnt = len;
+    m_dma->maddr = reinterpret_cast<uint32_t>(data);
+    dma_channel_enable(m_dma, TRUE);
 
     const uint32_t deadline = lf_get_tick() + timeoutMs;
-    while (ST7735_DMA_CHANNEL->dtcnt != 0u) {
+    while (m_dma->dtcnt != 0u) {
         if (lf_get_tick() >= deadline) {
-            dma_channel_enable(ST7735_DMA_CHANNEL, FALSE);
+            dma_channel_enable(m_dma, FALSE);
             return false;
         }
     }
-    while (spi_i2s_flag_get(ST7735_SPI, SPI_I2S_BF_FLAG) != RESET) {
+    while (spi_i2s_flag_get(m_spi, SPI_I2S_BF_FLAG) != RESET) {
         if (lf_get_tick() >= deadline) break;
     }
 
     /* 收尾必须关通道: 传输完 dtcnt 归零, 但 SPI 的 TXE 请求仍一直有效,
      * 若把通道留在使能态, 部分批次会把 CNT=0 当作 65536 再冲一轮垃圾数据。 */
-    dma_channel_enable(ST7735_DMA_CHANNEL, FALSE);
+    dma_channel_enable(m_dma, FALSE);
     return true;
 }
 #endif // ST7735_USE_DMA
-} // namespace
 
-extern "C" void ST7735_FillRectangle_DMA(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
+void ST7735::fillRectangleDma(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) noexcept
 {
 #if (ST7735_USE_DMA == 0)
-    ST7735_FillRectangle(x, y, w, h, color);
+    fillRectangle(x, y, w, h, color);
 #else
-    if (!g_initialized) return;
+    if (!m_initialized) return;
     if (!clipRect(x, y, w, h)) return;
 
     csLow();
@@ -634,15 +630,15 @@ extern "C" void ST7735_FillRectangle_DMA(uint16_t x, uint16_t y, uint16_t w, uin
     const uint8_t hi = static_cast<uint8_t>(color >> 8);
     const uint8_t lo = static_cast<uint8_t>(color & 0xFFu);
     for (uint16_t i = 0; i < w; ++i) {
-        g_rowBuf[i * 2u]      = hi;
-        g_rowBuf[i * 2u + 1u] = lo;
+        m_rowBuf[i * 2u]      = hi;
+        m_rowBuf[i * 2u + 1u] = lo;
     }
 
     dcData();
     const uint16_t rowBytes = static_cast<uint16_t>(w * 2u);
     for (uint16_t row = 0; row < h; ++row) {
-        if (!dmaTransfer(g_rowBuf, rowBytes, ST7735_DMA_TIMEOUT_MS)) {
-            spiWriteBlock(g_rowBuf, rowBytes);
+        if (!dmaTransfer(m_rowBuf, rowBytes, ST7735_DMA_TIMEOUT_MS)) {
+            spiWriteBlock(m_rowBuf, rowBytes);
         }
     }
     spiWaitIdle();
@@ -650,17 +646,18 @@ extern "C" void ST7735_FillRectangle_DMA(uint16_t x, uint16_t y, uint16_t w, uin
 #endif
 }
 
-extern "C" void ST7735_FillScreen_DMA(uint16_t color)
+void ST7735::fillScreenDma(uint16_t color) noexcept
 {
-    ST7735_FillRectangle_DMA(0, 0, g_width, g_height, color);
+    fillRectangleDma(0, 0, m_width, m_height, color);
 }
 
-extern "C" void ST7735_DrawImage_DMA(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_t *data)
+void ST7735::drawImageDma(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                          const uint16_t *data) noexcept
 {
 #if (ST7735_USE_DMA == 0)
-    ST7735_DrawImage(x, y, w, h, data);
+    drawImage(x, y, w, h, data);
 #else
-    if (!g_initialized || data == nullptr) return;
+    if (!m_initialized || data == nullptr) return;
     if (!clipRect(x, y, w, h)) return;
 
     csLow();
@@ -671,11 +668,11 @@ extern "C" void ST7735_DrawImage_DMA(uint16_t x, uint16_t y, uint16_t w, uint16_
     for (uint16_t row = 0; row < h; ++row) {
         const uint16_t *src = data + static_cast<std::size_t>(row) * w;
         for (uint16_t i = 0; i < w; ++i) {
-            g_rowBuf[i * 2u]      = static_cast<uint8_t>(src[i] >> 8);
-            g_rowBuf[i * 2u + 1u] = static_cast<uint8_t>(src[i] & 0xFFu);
+            m_rowBuf[i * 2u]      = static_cast<uint8_t>(src[i] >> 8);
+            m_rowBuf[i * 2u + 1u] = static_cast<uint8_t>(src[i] & 0xFFu);
         }
-        if (!dmaTransfer(g_rowBuf, rowBytes, ST7735_DMA_TIMEOUT_MS)) {
-            spiWriteBlock(g_rowBuf, rowBytes);
+        if (!dmaTransfer(m_rowBuf, rowBytes, ST7735_DMA_TIMEOUT_MS)) {
+            spiWriteBlock(m_rowBuf, rowBytes);
         }
     }
     spiWaitIdle();
@@ -686,10 +683,10 @@ extern "C" void ST7735_DrawImage_DMA(uint16_t x, uint16_t y, uint16_t w, uint16_
 /*============================================================================
  * 文本
  *============================================================================*/
-extern "C" void ST7735_WriteChar(uint16_t x, uint16_t y, char ch,
-                                 const FontDef &font, uint16_t color, uint16_t bgcolor)
+void ST7735::writeChar(uint16_t x, uint16_t y, char ch,
+                       const FontDef &font, uint16_t color, uint16_t bgcolor) noexcept
 {
-    if (!g_initialized) return;
+    if (!m_initialized) return;
 
     const uint8_t c = static_cast<uint8_t>(ch);
     if (c < 32u) return;
@@ -700,10 +697,10 @@ extern "C" void ST7735_WriteChar(uint16_t x, uint16_t y, char ch,
     drawGlyph(x, y, glyph, font.width, font.height, color, bgcolor);
 }
 
-extern "C" void ST7735_WriteString(uint16_t x, uint16_t y, const char *str,
-                                   const FontDef &font, uint16_t color, uint16_t bgcolor)
+void ST7735::writeString(uint16_t x, uint16_t y, const char *str,
+                         const FontDef &font, uint16_t color, uint16_t bgcolor) noexcept
 {
-    if (!g_initialized || str == nullptr) return;
+    if (!m_initialized || str == nullptr) return;
 
     while (*str != '\0') {
         const uint8_t ch = static_cast<uint8_t>(*str++);
@@ -715,18 +712,18 @@ extern "C" void ST7735_WriteString(uint16_t x, uint16_t y, const char *str,
         } else {
             /* 工程子集里没编进来的字形: 只刷背景色,
                避免上一次显示的内容残留在该字符格里 */
-            ST7735_FillRectangle(x, y, font.width, font.height, bgcolor);
+            fillRectangle(x, y, font.width, font.height, bgcolor);
         }
         x = static_cast<uint16_t>(x + font.width);
 
-        if (static_cast<uint32_t>(x) + font.width > g_width) break;
+        if (static_cast<uint32_t>(x) + font.width > m_width) break;
     }
 }
 
-extern "C" void ST7735_WriteStringUTF8(uint16_t x, uint16_t y, const char *str,
-                                       const FontDef &font, uint16_t color, uint16_t bgcolor)
+void ST7735::writeStringUtf8(uint16_t x, uint16_t y, const char *str,
+                             const FontDef &font, uint16_t color, uint16_t bgcolor) noexcept
 {
-    if (!g_initialized || str == nullptr) return;
+    if (!m_initialized || str == nullptr) return;
 
     while (*str != '\0') {
         uint16_t uni = 0;
@@ -757,12 +754,12 @@ extern "C" void ST7735_WriteStringUTF8(uint16_t x, uint16_t y, const char *str,
         }
         x = static_cast<uint16_t>(x + font.width);
 
-        if (static_cast<uint32_t>(x) + font.width > g_width) break;
+        if (static_cast<uint32_t>(x) + font.width > m_width) break;
     }
 }
 
-extern "C" void ST7735_Print(uint16_t x, uint16_t y, const FontDef &font,
-                             uint16_t color, uint16_t bgcolor, const char *format, ...)
+void ST7735::print(uint16_t x, uint16_t y, const FontDef &font,
+                   uint16_t color, uint16_t bgcolor, const char *format, ...)
 {
     char buf[96];
     va_list args;
@@ -770,88 +767,88 @@ extern "C" void ST7735_Print(uint16_t x, uint16_t y, const FontDef &font,
     (void)vsnprintf(buf, sizeof(buf), format, args);
     va_end(args);
 
-    ST7735_WriteString(x, y, buf, font, color, bgcolor);
+    writeString(x, y, buf, font, color, bgcolor);
 }
 
 /*============================================================================
  * 图形原语
  *============================================================================*/
-extern "C" void ST7735_DrawHLine(uint16_t x, uint16_t y, uint16_t w, uint16_t color)
+void ST7735::drawHLine(uint16_t x, uint16_t y, uint16_t w, uint16_t color) noexcept
 {
-    ST7735_FillRectangle(x, y, w, 1, color);
+    fillRectangle(x, y, w, 1, color);
 }
 
-extern "C" void ST7735_DrawVLine(uint16_t x, uint16_t y, uint16_t h, uint16_t color)
+void ST7735::drawVLine(uint16_t x, uint16_t y, uint16_t h, uint16_t color) noexcept
 {
-    ST7735_FillRectangle(x, y, 1, h, color);
+    fillRectangle(x, y, 1, h, color);
 }
 
-extern "C" void ST7735_DrawRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
+void ST7735::drawRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) noexcept
 {
     if (w == 0u || h == 0u) return;
-    ST7735_DrawHLine(x, y, w, color);
-    ST7735_DrawHLine(x, static_cast<uint16_t>(y + h - 1u), w, color);
-    ST7735_DrawVLine(x, y, h, color);
-    ST7735_DrawVLine(static_cast<uint16_t>(x + w - 1u), y, h, color);
+    drawHLine(x, y, w, color);
+    drawHLine(x, static_cast<uint16_t>(y + h - 1u), w, color);
+    drawVLine(x, y, h, color);
+    drawVLine(static_cast<uint16_t>(x + w - 1u), y, h, color);
 }
 
-extern "C" void ST7735_DrawRoundRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
-                                     uint8_t r, uint16_t color)
+void ST7735::drawRoundRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                           uint8_t r, uint16_t color) noexcept
 {
     if (w == 0u || h == 0u) return;
-    if (r == 0u) { ST7735_DrawRect(x, y, w, h, color); return; }
+    if (r == 0u) { drawRect(x, y, w, h, color); return; }
 
     const uint16_t d = static_cast<uint16_t>(2u * r);
-    if (w <= d || h <= d) { ST7735_DrawRect(x, y, w, h, color); return; }
+    if (w <= d || h <= d) { drawRect(x, y, w, h, color); return; }
 
-    ST7735_DrawHLine(static_cast<uint16_t>(x + r), y, static_cast<uint16_t>(w - d), color);
-    ST7735_DrawHLine(static_cast<uint16_t>(x + r), static_cast<uint16_t>(y + h - 1u),
-                     static_cast<uint16_t>(w - d), color);
-    ST7735_DrawVLine(x, static_cast<uint16_t>(y + r), static_cast<uint16_t>(h - d), color);
-    ST7735_DrawVLine(static_cast<uint16_t>(x + w - 1u), static_cast<uint16_t>(y + r),
-                     static_cast<uint16_t>(h - d), color);
+    drawHLine(static_cast<uint16_t>(x + r), y, static_cast<uint16_t>(w - d), color);
+    drawHLine(static_cast<uint16_t>(x + r), static_cast<uint16_t>(y + h - 1u),
+              static_cast<uint16_t>(w - d), color);
+    drawVLine(x, static_cast<uint16_t>(y + r), static_cast<uint16_t>(h - d), color);
+    drawVLine(static_cast<uint16_t>(x + w - 1u), static_cast<uint16_t>(y + r),
+              static_cast<uint16_t>(h - d), color);
 
     const int16_t rr = static_cast<int16_t>(r);
     for (int16_t i = 0; i <= rr; ++i) {
         for (int16_t j = 0; j <= rr; ++j) {
             if ((i * i + j * j) <= rr * rr) {
-                ST7735_DrawPixel(static_cast<uint16_t>(x + r - i), static_cast<uint16_t>(y + r - j), color);
-                ST7735_DrawPixel(static_cast<uint16_t>(x + w - r - 1 + i), static_cast<uint16_t>(y + r - j), color);
-                ST7735_DrawPixel(static_cast<uint16_t>(x + r - i), static_cast<uint16_t>(y + h - r - 1 + j), color);
-                ST7735_DrawPixel(static_cast<uint16_t>(x + w - r - 1 + i), static_cast<uint16_t>(y + h - r - 1 + j), color);
+                drawPixel(static_cast<uint16_t>(x + r - i), static_cast<uint16_t>(y + r - j), color);
+                drawPixel(static_cast<uint16_t>(x + w - r - 1 + i), static_cast<uint16_t>(y + r - j), color);
+                drawPixel(static_cast<uint16_t>(x + r - i), static_cast<uint16_t>(y + h - r - 1 + j), color);
+                drawPixel(static_cast<uint16_t>(x + w - r - 1 + i), static_cast<uint16_t>(y + h - r - 1 + j), color);
             }
         }
     }
 }
 
-extern "C" void ST7735_FillRoundRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
-                                     uint8_t r, uint16_t color)
+void ST7735::fillRoundRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                           uint8_t r, uint16_t color) noexcept
 {
     if (w == 0u || h == 0u) return;
-    if (r == 0u) { ST7735_FillRectangle(x, y, w, h, color); return; }
+    if (r == 0u) { fillRectangle(x, y, w, h, color); return; }
 
     const uint16_t d = static_cast<uint16_t>(2u * r);
-    if (w <= d || h <= d) { ST7735_FillRectangle(x, y, w, h, color); return; }
+    if (w <= d || h <= d) { fillRectangle(x, y, w, h, color); return; }
 
-    ST7735_FillRectangle(static_cast<uint16_t>(x + r), y, static_cast<uint16_t>(w - d), h, color);
-    ST7735_FillRectangle(x, static_cast<uint16_t>(y + r), r, static_cast<uint16_t>(h - d), color);
-    ST7735_FillRectangle(static_cast<uint16_t>(x + w - r), static_cast<uint16_t>(y + r),
-                         r, static_cast<uint16_t>(h - d), color);
+    fillRectangle(static_cast<uint16_t>(x + r), y, static_cast<uint16_t>(w - d), h, color);
+    fillRectangle(x, static_cast<uint16_t>(y + r), r, static_cast<uint16_t>(h - d), color);
+    fillRectangle(static_cast<uint16_t>(x + w - r), static_cast<uint16_t>(y + r),
+                  r, static_cast<uint16_t>(h - d), color);
 
     const int16_t rr = static_cast<int16_t>(r);
     for (int16_t i = 0; i <= rr; ++i) {
         for (int16_t j = 0; j <= rr; ++j) {
             if ((i * i + j * j) <= rr * rr) {
-                ST7735_DrawPixel(static_cast<uint16_t>(x + r - i), static_cast<uint16_t>(y + r - j), color);
-                ST7735_DrawPixel(static_cast<uint16_t>(x + w - r - 1 + i), static_cast<uint16_t>(y + r - j), color);
-                ST7735_DrawPixel(static_cast<uint16_t>(x + r - i), static_cast<uint16_t>(y + h - r - 1 + j), color);
-                ST7735_DrawPixel(static_cast<uint16_t>(x + w - r - 1 + i), static_cast<uint16_t>(y + h - r - 1 + j), color);
+                drawPixel(static_cast<uint16_t>(x + r - i), static_cast<uint16_t>(y + r - j), color);
+                drawPixel(static_cast<uint16_t>(x + w - r - 1 + i), static_cast<uint16_t>(y + r - j), color);
+                drawPixel(static_cast<uint16_t>(x + r - i), static_cast<uint16_t>(y + h - r - 1 + j), color);
+                drawPixel(static_cast<uint16_t>(x + w - r - 1 + i), static_cast<uint16_t>(y + h - r - 1 + j), color);
             }
         }
     }
 }
 
-extern "C" void ST7735_DrawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color)
+void ST7735::drawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color) noexcept
 {
     int16_t dx = static_cast<int16_t>(x1 - x0);
     int16_t dy = static_cast<int16_t>(y1 - y0);
@@ -863,7 +860,7 @@ extern "C" void ST7735_DrawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, 
     int16_t err = static_cast<int16_t>(dx - dy);
     for (;;) {
         if (x0 >= 0 && y0 >= 0) {
-            ST7735_DrawPixel(static_cast<uint16_t>(x0), static_cast<uint16_t>(y0), color);
+            drawPixel(static_cast<uint16_t>(x0), static_cast<uint16_t>(y0), color);
         }
         if (x0 == x1 && y0 == y1) break;
 
@@ -873,7 +870,7 @@ extern "C" void ST7735_DrawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, 
     }
 }
 
-extern "C" void ST7735_DrawCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color)
+void ST7735::drawCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color) noexcept
 {
     int16_t x = 0;
     int16_t y = r;
@@ -890,7 +887,7 @@ extern "C" void ST7735_DrawCircle(int16_t x0, int16_t y0, int16_t r, uint16_t co
                                 static_cast<int16_t>(y0 - x), static_cast<int16_t>(y0 - x) };
         for (int k = 0; k < 8; ++k) {
             if (px[k] >= 0 && py[k] >= 0) {
-                ST7735_DrawPixel(static_cast<uint16_t>(px[k]), static_cast<uint16_t>(py[k]), color);
+                drawPixel(static_cast<uint16_t>(px[k]), static_cast<uint16_t>(py[k]), color);
             }
         }
 
@@ -904,21 +901,21 @@ extern "C" void ST7735_DrawCircle(int16_t x0, int16_t y0, int16_t r, uint16_t co
     }
 }
 
-extern "C" void ST7735_FillCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color)
+void ST7735::fillCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color) noexcept
 {
     int16_t x = 0;
     int16_t y = r;
     int16_t err = static_cast<int16_t>(1 - r);
 
     while (x <= y) {
-        ST7735_FillRectangle(static_cast<uint16_t>(x0 - x), static_cast<uint16_t>(y0 + y),
-                             static_cast<uint16_t>(2 * x + 1), 1, color);
-        ST7735_FillRectangle(static_cast<uint16_t>(x0 - x), static_cast<uint16_t>(y0 - y),
-                             static_cast<uint16_t>(2 * x + 1), 1, color);
-        ST7735_FillRectangle(static_cast<uint16_t>(x0 - y), static_cast<uint16_t>(y0 + x),
-                             static_cast<uint16_t>(2 * y + 1), 1, color);
-        ST7735_FillRectangle(static_cast<uint16_t>(x0 - y), static_cast<uint16_t>(y0 - x),
-                             static_cast<uint16_t>(2 * y + 1), 1, color);
+        fillRectangle(static_cast<uint16_t>(x0 - x), static_cast<uint16_t>(y0 + y),
+                      static_cast<uint16_t>(2 * x + 1), 1, color);
+        fillRectangle(static_cast<uint16_t>(x0 - x), static_cast<uint16_t>(y0 - y),
+                      static_cast<uint16_t>(2 * x + 1), 1, color);
+        fillRectangle(static_cast<uint16_t>(x0 - y), static_cast<uint16_t>(y0 + x),
+                      static_cast<uint16_t>(2 * y + 1), 1, color);
+        fillRectangle(static_cast<uint16_t>(x0 - y), static_cast<uint16_t>(y0 - x),
+                      static_cast<uint16_t>(2 * y + 1), 1, color);
 
         ++x;
         if (err < 0) {
@@ -930,20 +927,17 @@ extern "C" void ST7735_FillCircle(int16_t x0, int16_t y0, int16_t r, uint16_t co
     }
 }
 
-extern "C" void ST7735_DrawTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
-                                    int16_t x2, int16_t y2, uint16_t color)
+void ST7735::drawTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                          int16_t x2, int16_t y2, uint16_t color) noexcept
 {
-    ST7735_DrawLine(x0, y0, x1, y1, color);
-    ST7735_DrawLine(x1, y1, x2, y2, color);
-    ST7735_DrawLine(x2, y2, x0, y0, color);
+    drawLine(x0, y0, x1, y1, color);
+    drawLine(x1, y1, x2, y2, color);
+    drawLine(x2, y2, x0, y0, color);
 }
 
-namespace {
-void swapI16(int16_t &a, int16_t &b) noexcept { const int16_t t = a; a = b; b = t; }
-
 /** 扫描线填充三角形的一条水平边 (修正 491 参考中两侧共用同一边的退化问题)。 */
-void fillSpan(int16_t xa, int16_t ya, int16_t xb, int16_t yb,
-              int16_t xc, int16_t yc, uint16_t color)
+void ST7735::fillSpan(int16_t xa, int16_t ya, int16_t xb, int16_t yb,
+                      int16_t xc, int16_t yc, uint16_t color) noexcept
 {
     const int16_t dxa = static_cast<int16_t>(xb - xa);
     const int16_t dxc = static_cast<int16_t>(xc - xa);
@@ -956,14 +950,13 @@ void fillSpan(int16_t xa, int16_t ya, int16_t xb, int16_t yb,
         int16_t xe = static_cast<int16_t>(xa + (y - ya) * dxc / dyc);
         if (xs > xe) swapI16(xs, xe);
         if (xs < 0) xs = 0;
-        ST7735_FillRectangle(static_cast<uint16_t>(xs), static_cast<uint16_t>(y),
-                             static_cast<uint16_t>(xe - xs + 1), 1, color);
+        fillRectangle(static_cast<uint16_t>(xs), static_cast<uint16_t>(y),
+                      static_cast<uint16_t>(xe - xs + 1), 1, color);
     }
 }
-} // namespace
 
-extern "C" void ST7735_FillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
-                                    int16_t x2, int16_t y2, uint16_t color)
+void ST7735::fillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                          int16_t x2, int16_t y2, uint16_t color) noexcept
 {
     /* 按 y 升序排序三个顶点 */
     if (y0 > y1) { swapI16(y0, y1); swapI16(x0, x1); }
@@ -977,8 +970,8 @@ extern "C" void ST7735_FillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t 
         if (x1 > xe) xe = x1;
         if (x2 > xe) xe = x2;
         if (xs < 0) xs = 0;
-        ST7735_FillRectangle(static_cast<uint16_t>(xs), static_cast<uint16_t>(y0),
-                             static_cast<uint16_t>(xe - xs + 1), 1, color);
+        fillRectangle(static_cast<uint16_t>(xs), static_cast<uint16_t>(y0),
+                      static_cast<uint16_t>(xe - xs + 1), 1, color);
         return;
     }
 
@@ -992,3 +985,5 @@ extern "C" void ST7735_FillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t 
         fillSpan(x2, y2, x1, y1, x3, y1, color);
     }
 }
+
+} // namespace LoveFinderLib
