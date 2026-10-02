@@ -191,10 +191,14 @@ public:
     }
 
     /**
-     * @brief 初始化引脚与中断。
+     * @brief 完整初始化: 自己配 GPIO + SCFG + EXINT + NVIC, 然后绑定引脚。
      * @param port   按键 GPIO 端口
      * @param pin    引脚掩码
      * @param config 时序配置
+     *
+     * 这是【库内配置硬件】的唯一模式, 也是本库"初始化归 ATWK"原则的例外 ——
+     * 理由: 按键要可靠判定按下与释放必须用【双沿】EXINT, 而 ATWK 的 EXINT
+     * 配置只给单边沿, 库至少要改触发沿。详见 attach() 与 AGENTS.md §9。
      */
     void init(gpio_type *port, std::uint16_t pin, const BUTTON_Config &config) noexcept
     {
@@ -209,6 +213,29 @@ public:
     {
         init(port, pin, BUTTON_Config::getDefault());
     }
+
+    /**
+     * @brief 轻量绑定: 硬件已由 ATWK 配好, 本类【不写任何硬件寄存器】。
+     *
+     * 与 init() 的唯一差别: 不调用 configureExti()。绑定后用法完全一样
+     * (主循环 update() / 中断里 onExti())。
+     *
+     * ⚠ ATWK 侧必须把该引脚配成:
+     *    - GPIO : 输入模式 (activeLow 时上拉, 否则下拉)
+     *    - EXINT: 使能 + 【上下沿都触发】+ NVIC 使能
+     *   若 ATWK 只配了单边沿, 按键仍能用 (释放靠 update() 轮询兜底),
+     *   但中断辨不出释放沿, 长按/双击的时刻精度会下降。
+     *   config 在此模式下只影响软件语义 (消抖 / 长按 / 双击时长), 不碰硬件。
+     */
+    void attach(gpio_type *port, std::uint16_t pin,
+                const BUTTON_Config &config = BUTTON_Config::getDefault()) noexcept
+    {
+        m_port   = port;
+        m_pin    = pin;
+        m_config = config;
+        reset();
+    }
+
 
     void reset() noexcept
     {

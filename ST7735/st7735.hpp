@@ -73,6 +73,7 @@
 /* ★ SPI 字节收发转调库通用模块 (SPI/spi_io.cpp) —— 本类只管 CS/DC/面板/像素,
  *   不再自带一份 TDBE 忙等实现, 避免两处 SPI 读写代码各自演化分叉。 */
 #include "spi_io.hpp"
+#include "spi_bus.hpp"      /* SpiBus / SpiCs / SpiCsLock — CS 归属与互斥 */
 
 #include "wk_system.h"      /* wk_delay_ms/µs — WorkBench BSP (仿 PY32 的 LL_mDelay) */
 #include "font.h"           /* FontDef + 字体名册 + font_get_glyph* (PickSoul 生成) */
@@ -266,15 +267,18 @@ public:
      * 全部形参可缺省, 缺省时回落到 lf_config.h 的对应宏 ——
      * `lcd.init()` 与旧 `ST7735_Init()` 行为完全一致。
      *
-     * @param spi      SPI 外设句柄; nullptr = 用 ST7735_SPI (通常 SPI1)
+     * @param bus      所属 SPI 总线 (可与其他设备共用一条, 见 SPI/spi_bus.hpp);
+     *                 nullptr = 本对象【内建一条】并绑 ST7735_SPI (通常 SPI1)。
+     *                 本屏的 CS 会自动 addDevice() 登记到所用总线。
      * @param dma      DMA 通道;     nullptr = 用 ST7735_DMA_CHANNEL
      *                 (ST7735_USE_DMA=0 时此参数被忽略)
      * @param pins     四组控制引脚; 全 nullptr = 用 ST7735_*_PORT/PIN 宏
      * @param panelIdx 面板批次 0..3 = A/B/C/D; 缺省取 lf_config.h 的选择
      *
      * ⚠ 必须先 wk_spi1_init() (SPI 时钟未开时首字节死等 TDBE)。
+     * ⚠ 共用总线时建议先 bus.releaseAll() 保证各设备 CS 都在不选中态, 再逐个 init。
      */
-    void init(spi_type *spi = nullptr,
+    void init(SpiBus *bus = nullptr,
               dma_channel_type *dma = nullptr,
               const PinSet &pins = PinSet{},
               uint8_t panelIdx = ST7735_DEFAULT_PANEL_IDX) noexcept;
@@ -346,9 +350,16 @@ private:
     /*==========================================================================
      * 硬件绑定 (init 填入; 不传形参时取 lf_config.h 的宏)
      *==========================================================================*/
-    spi_type         *m_spi = ST7735_SPI;
+    /* m_spi 是 m_bus->spi() 的缓存 (热路径直接用, 不每次都经总线取) */
+    spi_type         *m_spi = nullptr;
     dma_channel_type *m_dma = nullptr;
-    gpio_type *m_csPort  = nullptr;  uint16_t m_csPin  = 0;
+
+    /* 总线与片选: init 时绑定 —— 传了 bus 就用它, 否则用内建 m_ownBus。
+       本屏 CS 会自动 addDevice() 登记到所用总线 (releaseAll / 冲突检测用)。 */
+    SpiBus  *m_bus = nullptr;
+    SpiBus   m_ownBus{};
+    SpiCs    m_cs{};
+
     gpio_type *m_dcPort  = nullptr;  uint16_t m_dcPin  = 0;
     gpio_type *m_resPort = nullptr;  uint16_t m_resPin = 0;
     gpio_type *m_enPort  = nullptr;  uint16_t m_enPin  = 0;
@@ -377,8 +388,10 @@ private:
     /*==========================================================================
      * 底层原语 (直调 AT32 BSP)
      *==========================================================================*/
-    void csLow()  noexcept { gpio_bits_reset(m_csPort, m_csPin); }
-    void csHigh() noexcept { gpio_bits_set(m_csPort, m_csPin); }
+    /* 选中本屏片选 (RAII: 构造拉低, 析构等空 + 拉高 + 释放占用)。
+       返回未持有时说明总线正被别的设备占着 —— 单设备场景不会发生;
+       共用总线时调用方应放弃本次操作 (见 SPI/spi_bus.hpp 的两条硬约束)。 */
+    [[nodiscard]] SpiCsLock selectCs() noexcept { return m_bus->select(m_cs); }
 
     void dcCommand() noexcept { gpio_bits_reset(m_dcPort, m_dcPin); }
     void dcData()    noexcept { gpio_bits_set(m_dcPort, m_dcPin); }

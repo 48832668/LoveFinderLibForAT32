@@ -33,8 +33,8 @@ LoveFinderLibForAT32\
 ├── AGENTS.md                   # ★ 本文件
 ├── PROJECT_SUMMARY.md          #   交付清单与验证结果
 │
-├── I2C\                        # 阻塞式硬件 I2C 主机 (i2c_master 自由函数)
-├── SPI\                        # 阻塞式硬件 SPI 收发 (spi_io 自由函数, 初始化归 ATWK)
+├── I2C\                        # 硬件 I2C 主机 (i2c_master) + 从设备寄存器助手 (i2c_device)
+├── SPI\                        # SPI 收发 (spi_io) + 总线片选管理 (spi_bus)
 ├── PWM\                        # TMR 占空比调整 (只写 CCR, 初始化归 ATWK)
 ├── BUTTON\                     # 按键: 单击 / 双击 / 长按 + 充能 (EXINT 上下沿, ISR 只置标志)
 ├── TIMER\                      # 可选的 TIM 毫秒时基 (按键脱离 SysTick 时才用)
@@ -68,6 +68,34 @@ LoveFinderLibForAT32\
 │ AT32 BSP  at32f421_*.c/h  (WorkBench 生成)                │
 └──────────────────────────────────────────────────────────┘
 ```
+
+### 分层契约（谁配硬件 / 谁做读写）
+
+上面的图说的是「代码怎么编译进来」；这条契约说的是「**硬件由谁初始化**」——
+两者是**不同的轴**，别混。2026-10-02 确立。
+
+| 层 | 内容 | 谁写 | 谁用 |
+|---|---|---|---|
+| **L0 硬件配置** | GPIO 复用/模式、外设参数（SPI 分频与 CPOL/CPHA、I2C 速率、TMR 周期）、时钟使能 | **ATWK 生成 `wk_*.c`** | 用户点鼠标 |
+| **L1 总线原语** | `i2c_master` · `i2c_device` · `spi_io` · `pwm` · `timer` | 库 | **写设备驱动的人** |
+| **L2 设备语义** | SW3538 / SW3526 / SW2305 / FUSB302 / ST7735 / BUTTON / NTC | 库 | **写应用的人** |
+| L3 应用 | `main.cpp` / `app_*` / `ui_*` | 工程 | — |
+
+**核心规则：总线与复用归 ATWK，库只做运行时读写。**
+
+- 库**不**配总线引脚、不调 `spi_init` / `i2c_init` / `gpio_pin_mux_config`、
+  不在运行中改外设参数 —— SPI 就按 ATWK 设的分频/极性/相位收发。
+- **设备控制脚是例外**：`CS` / `DC` / `RES` / `EN` 这类【纯 GPIO 输出】不是复用脚，
+  由设备驱动自己配一次（如 ST7735 的 `ensurePins()`），初始电平也只有驱动知道。
+  ATWK 不必配它们 —— 契约管的是**复用与总线参数**，不是每个设备自己的控制线。
+- **L1 对 L2 可见、对 L3 隐藏**：应用代码里不应出现 `i2cMemWrite` / `spiWriteByte`
+  这类原语，只应出现 `g_sw[0].readMeasurement()` / `g_lcd.fillScreen()`。
+- 唯一需要讨论的例外是 **BUTTON 的 EXINT**：按键可靠判定要**双沿**，而 ATWK
+  只给单边沿。现在两条路都有 —— `attach()` 把硬件留给 ATWK（推荐），
+  `init()` 保留库自配模式。见 §5 BUTTON 与 §9。
+
+⚠ 这条契约**不等于**「库不做寄存器读写」—— 恰恰相反，L2 设备驱动就是
+「若干寄存器读写的集合体」，只是它把 L1 藏在身后，应用不必知道总线细节。
 
 ### 工程侧契约（库依赖的全部工程符号）
 
@@ -128,8 +156,9 @@ LoveFinderLib::ST7735 lcd;
 lcd.init();       /* 形参全可缺省 = 用 lf_config.h 的宏, 等价旧 ST7735_Init() */
 ```
 
-**硬件绑定是可选注入** —— 不传形参就取 `lf_config.h` 的宏；
-要接第二块屏（另一路 SPI）各建一个实例、传对应句柄即可。
+**硬件绑定是可选注入** —— 不传形参就取 `lf_config.h` 的宏（LCD 会自建一条
+`SpiBus` 并绑 `ST7735_SPI`）；要接第二块屏（另一路 SPI）各建一个实例、传对应
+总线即可。
 
 ---
 
@@ -139,12 +168,25 @@ lcd.init();       /* 形参全可缺省 = 用 lf_config.h 的宏, 等价旧 ST77
 
 ```cpp
 LoveFinderLib::Button key;
-key.init(BUTTON_KEY_PORT, BUTTON_KEY_PIN);   /* 直调 gpio_/scfg_/exint_/nvic_ */
+
+/* 方式一 (库自配硬件): 直调 gpio_/scfg_/exint_/nvic_ */
+key.init(BUTTON_KEY_PORT, BUTTON_KEY_PIN);
+
+/* 方式二 (推荐, 硬件归 ATWK): ATWK 把该引脚配成
+   输入+上拉 + EXINT 上下沿都触发 + NVIC 使能; 本类不写任何硬件寄存器 */
+key.attach(BUTTON_KEY_PORT, BUTTON_KEY_PIN);
+
 /* EXINT 中: key.onExti();   主循环 5ms: switch(key.update()) {...} */
 ```
 
+**两种绑定方式的差别只有「谁配 EXINT」**：`init()` 自己配 GPIO/SCFG/EXINT/NVIC；
+`attach()` 全留给 ATWK，本类只做语义（消抖 / 长按 / 双击 / 充能）。
+⚠ `attach()` 下 ATWK **必须把 EXINT 配成上下沿都触发**，否则释放沿认不出，
+长按/双击的时刻精度会降（功能仍能用，靠 `update()` 轮询兜底）。
+
 EXINT 配置（输入+上拉 → SCFG 线绑定 → 触发沿 → NVIC 分组中断）已内联在
-`BUTTON.cpp`。状态机：`IDLE → DEBOUNCE → PRESSED → WAIT_CLICK → IDLE`。
+`BUTTON.cpp` 的 `configureExti()`（**仅在 `init()` 路径调用**）。状态机：
+`IDLE → DEBOUNCE → PRESSED → WAIT_CLICK → IDLE`。
 长按触发 `LONG_PRESS` 一次，并开始 0~100 充能（`getChargePercent()`）。
 **工程必须定义对应 EXINT 分组中断并在其中调 `onExti()`**（否则按键触发即进
 弱定义死循环）。
@@ -192,7 +234,7 @@ uint32_t ms = LoveFinderLib::timerNow();
   不用定时器的工程（907）根本没有 `tmr_type`（2026-10-02 实测踩到）。
   同理 BUTTON.hpp/.cpp 也自带 `at32f421_gpio.h`/`_exint.h`/`_scfg.h`/`_misc.h`。
 
-### I2C — 阻塞式硬件 I2C 主机
+### I2C — 硬件 I2C 主机 + 从设备寄存器助手
 
 ```cpp
 using namespace LoveFinderLib;
@@ -200,29 +242,50 @@ i2cMemWrite(I2C1, 0x3C, reg, &v, 1, 100);
 std::optional<uint8_t> v = i2cReadReg8(I2C1, 0x3C, reg, 100);
 ```
 
-自由函数收 `i2c_type*`，轮询标志 + `lf_get_tick()` 超时；`memRead` 用
-repeated START（规范寄存器读时序）。**软件 Bitbang 后端已随平台层删除**
-（无工程使用；将来需要时在 `I2C/` 下新增实现）。
+`i2c_master.{hpp,cpp}`：自由函数收 `i2c_type*`，轮询标志 + `lf_get_tick()`
+超时；`memRead` 用 repeated START（规范寄存器读时序）。
 `i2cMasterRecover()` 只做外设软复位，GPIO 级 9 脉冲恢复由应用层自行实现。
 
-### SPI — 阻塞式硬件 SPI 收发
+`i2c_device.hpp` — **新驱动的推荐入口**：把 `bus + 7-bit 地址 + 超时` 绑成一个
+对象，驱动**组合**它，读写寄存器不必每次重复传三样东西：
+
+```cpp
+class MyChip {
+    I2cDevice m_dev;                                     // 组合, 不是继承
+public:
+    void init(i2c_type *bus) noexcept { m_dev.bind(bus, 0x3C); }
+    std::optional<uint8_t> id() noexcept { return m_dev.readReg8(0x00); }
+};
+```
+
+纯转发、无后端抽象。**已上板验证的 SW3538 / SW3526 / SW2305 / FUSB302 保持各自的
+写法不动**，不为统一而重测。
+
+**软件位敲 (Bitbang) 在 `i2c_sw.{hpp,cpp}`，是活跃模块**（907 的 IIC3 第三条
+总线用它），并没有被删除 —— 它有自己的总线描述 `SwI2cBus`，不并入 `i2c_device`
+（本库不做后端抽象层）。
+
+### SPI — 收发 (spi_io) + 总线片选 (spi_bus)
 
 ```cpp
 using namespace LoveFinderLib;
-csLow();
+
+/* 裸收发: 只搬字节, 片选要自己管 (多设备请用下面的 spi_bus) */
+SpiCs cs{GPIOB, GPIO_PINS_0};
+gpio_bits_reset(cs.port, cs.pin);        // 拉低 CS
 spiWriteByte(SPI1, 0x2A);
 spiWriteBlock(SPI1, frame, sizeof frame);
 spiWaitIdle(SPI1);                       // 翻 CS 前必须
-csHigh();
+gpio_bits_set(cs.port, cs.pin);          // 拉高
 
 uint8_t id[3];
 if (spiReadBlock(SPI1, id, 3)) { ... }   // 读: 发 0xFF dummy, false = 超时
 ```
 
-**初始化归 ATWK，库只搬字节** —— 不调 `spi_init`/`gpio_init`，运行中也不改
-任何 SPI 硬件参数（ATWK 设成什么样就按什么样收发）；实例由调用方传
-`spi_type*`。**CS 不归本模块管**（ST7735 有自己的 `csLow`/`csHigh`），
-调用顺序由设备驱动负责。
+**初始化归 ATWK，`spi_io` 只搬字节** —— 不调 `spi_init`/`gpio_init`，运行中也
+不改任何 SPI 硬件参数（ATWK 设成什么样就按什么样收发）；实例由调用方传
+`spi_type*`。**片选不归 `spi_io` 管** —— 多设备共总线用下面的 `spi_bus`；
+单设备驱动也可以只持一个 `SpiCs` 自己 toggle。
 
 - **写路径**（`spiWriteByte`/`spiWriteBlock`/`spiWaitIdle`）**忙等不查超时** ——
   与 `st7735.cpp` 已上板实现逐位一致，且热路径逐字节调 `lf_get_tick()` 会让
@@ -237,6 +300,34 @@ if (spiReadBlock(SPI1, id, 3)) { ... }   // 读: 发 0xFF dummy, false = 超时
 转调处必须写 `LoveFinderLib::` 限定名 —— 不限定会先命中类内成员，
 参数不匹配直接报错，不会回落到外层命名空间。
 未被引用的读函数经 `-ffunction-sections` + `--gc-sections` 被丢弃（nm 可确认）。
+
+#### spi_bus — 总线片选管理（多设备共总线）
+
+```cpp
+SpiBus spi1;
+spi1.init(SPI1);
+spi1.addDevice({GPIOB, GPIO_PINS_0});        // ST7735 的 CS
+spi1.addDevice({GPIOB, GPIO_PINS_1});        // W25Q128 的 CS
+spi1.releaseAll();                           // 开机: 全部不选中
+
+SpiCsLock lock = spi1.select({GPIOB, GPIO_PINS_1});
+if (lock.held()) {                           // 拉低该设备 CS
+    spiTransfer(spi1.spi(), tx, rx, len);
+}                                            // ~lock: 等空 + 拉高 + 释放
+```
+
+- **注册的是片选，不是设备对象** —— 总线不需要认识设备是谁，冲突检测按
+  `(port, pin)` 值比较即可；注册设备对象要长回一套基类，违反 §3。
+- **RAII 防漏放**：出作用域必拉高；两个设备同时选中会被拒并计入
+  `conflictCount()`（编码错误的诊断指标）。
+- `releaseAll()` 一次把所有登记设备置为不选中 —— 单个设备驱动做不到这件事。
+- ⚠ **不递归选中**：同一 CS 已选中时再 `select()` 也会被拒（内层析构会提前
+  拉高 CS）。需要长事务请在一个锁里做完，不要嵌套。
+- ⚠ **DMA 必须在锁作用域内跑完**：锁析构只 `spiWaitIdle`（等 SPI 移位寄存器
+  空），**不等 DMA**。ST7735 的 `dmaTransfer()` 内部等 `dtcnt` 归零，天然满足。
+- **DC 是设备私有脚，不进总线**（ST7735 的 `dcData()` 就是这样）。
+- **ST7735 已迁移**：`init(SpiBus*)`；不传则自建一条绑 `ST7735_SPI`，
+  其 CS 自动 `addDevice()` 登记。
 
 ### PWM — 占空比调整
 
@@ -362,9 +453,9 @@ float t = ntc.getTemp();      // ℃, 无效返回 NTC_INVALID_TEMP_C
 
 ```cpp
 LoveFinderLib::ST7735 lcd;
-lcd.init();                                   /* 形参全缺省 = lf_config.h 的宏 */
-/* lcd.init(SPI1);                           -- 只显式绑 SPI 句柄 */
-/* lcd.init(SPI1, DMA1_CHANNEL3, pins, 3);   -- 全套: SPI+DMA+引脚+面板批次 */
+lcd.init();                                   /* 形参全缺省: 自建 SpiBus 绑 lf_config.h 的宏 */
+/* lcd.init(&spi1);                          -- 挂到一条共用总线上 (见 §5 SPI/spi_bus) */
+/* lcd.init(&spi1, DMA1_CHANNEL3, pins, 3);  -- 全套: 总线+DMA+引脚+面板批次 */
 
 lcd.setBacklight(true);
 lcd.fillScreen(LoveFinderLib::ST7735::BLACK);
@@ -372,17 +463,25 @@ lcd.writeString(2, 2, "CH1 20.0V", Font_Subset_7x10,
                 LoveFinderLib::ST7735::WHITE, LoveFinderLib::ST7735::BLACK);
 ```
 
-`init(spi, dma, pins, panelIdx)` 四参全可缺省，缺省时回落到 `lf_config.h`
-的 `ST7735_SPI` / `ST7735_DMA_CHANNEL` / `ST7735_*_PORT/PIN` /
-`ST7735_PANEL_*`（`ST7735_PinSet` 是**类外**定义的 `LoveFinderLib::ST7735_PinSet`：
-嵌套类型的 NSDMI 不能用作同类成员函数的默认实参，GCC 会报
-*default member initializer … required before the end of its enclosing class*）。
+`init(bus, dma, pins, panelIdx)` 四参全可缺省：
+- `bus == nullptr` → 本对象**内建一条 `SpiBus`** 并绑 `ST7735_SPI`，屏的 CS 自动
+  登记进去；传 `&spi1` 则挂到外部共用总线（多设备场景）。
+- 其余缺省回落到 `lf_config.h` 的 `ST7735_DMA_CHANNEL` / `ST7735_*_PORT/PIN` /
+  `ST7735_PANEL_*`（`ST7735_PinSet` 是**类外**定义的
+  `LoveFinderLib::ST7735_PinSet`：嵌套类型的 NSDMI 不能用作同类成员函数的默认
+  实参，GCC 会报 *default member initializer … required before the end of its
+  enclosing class*）。
+
+**CS 走 `SpiCsLock`**（RAII，见 §5 SPI/spi_bus）：每个绘制操作 = 一次
+`selectCs()`，析构自动等空 + 拉高。单设备时 `held()` 恒真；共用总线时若
+`held()` 为假应放弃本次绘制。**旧的 `csLow()` / `csHigh()` 成员已删除。**
 
 硬件访问直调：
 
-- SPI 字节：`spi_i2s_flag_get(SPI_I2S_TDBE_FLAG)` → `spi_i2s_data_transmit`，
-  翻 CS 前等 `SPI_I2S_BF_FLAG` 清零
-- GPIO：`gpio_bits_set/reset(m_csPort/m_dcPort/m_resPort, …)`
+- SPI 字节：转调 `spi_io` 的 `spiWriteByte` / `spiWaitIdle` / `spiWriteBlock`
+  （成员形式是薄包装，实现单一来源）
+- GPIO：CS 经 `SpiBus`/`SpiCsLock`；DC/RES/EN 仍直调
+  `gpio_bits_set/reset(m_dcPort …)`
 - DMA：轮询 `m_dma->dtcnt == 0` + `lf_get_tick()` 超时
   （**工程 NVIC 未开 DMA 中断**，与 PY32 一样纯轮询；超时关通道退回轮询发送）
 - 延时：`wk_delay_ms`
@@ -520,11 +619,97 @@ $tc  = "C:\Users\ZWDX_LKJ\AppData\Local\at32-tools"
 > **未被引用的 `spiReadBlock`/`spiTransfer` 与整个 `pwm.cpp` 经
 > `-ffunction-sections` + `--gc-sections` 丢弃，nm 查不到符号 = 零成本**。
 > ⚠ PWM 只有编译验证（208 无调用方），上板验证待接入呼吸灯后补。
+>
+> **2026-10-03 新增 `spi_bus` 并把 ST7735 迁移过去**（片选注册 + RAII 互斥，
+> 见 §5 SPI/spi_bus）：208 零警告，FLASH **55 956 B / 85.38%**、
+> RAM **5 656 B / 34.52%**（上一步 55 536 B / 84.74%）。
+> +420 B Flash / +56 B RAM 来自 `SpiBus`/`SpiCsLock` 代码与 `m_ownBus` 成员
+> （编译选项是 `-O0`，这些小函数没有内联）。
+> ⚠ **ST7735 的 CS 语义改了（`csLow/csHigh` → `SpiCsLock`），必须重新上板
+> 验证**：开屏页 / 调试页清屏 / 主界面三处。另注意 `drawPixel` 每次绘制多一层
+> `SpiBus::select` + 锁构造析构调用，文字渲染的 CPU 开销会上升（SPI 传输本身
+> 不变）—— 若刷屏明显变慢再考虑批量绘制时共用一把锁。
 
 ---
 
-*最后更新: 2026-10-02*（ST7735 改为实例化 API，删除 60 个 `extern "C"` 全局函数，
-并取消 48x12 分块改走整屏单窗口（上板验证）；
-新增 SPI 收发 / PWM 占空比两个模块 —— 初始化全部归 ATWK，库只做读写；
-新增 TIMER 模块 + BUTTON 双沿/纯标志中断/可选时基；
-SW3538 加通路使能 init 形参与 VBUS 推导（上板验证））
+---
+
+## 9. 新增设备驱动规范
+
+写一个新芯片驱动时照着走。目标：**应用只看到设备语义，不看到总线原语**（§3）。
+
+### Step 1 — 挑接口层
+
+| 你的设备 | 用什么 |
+|---|---|
+| I2C 芯片（本质是寄存器集合） | `I2cDevice`（`I2C/i2c_device.hpp`）组合进驱动 |
+| SPI 设备，独占一条总线 | `SpiCs` 自己 toggle，或同样走 `SpiBus` |
+| SPI 设备，与其他设备共总线 | `SpiBus` + `SpiCs` + `SpiCsLock`（`SPI/spi_bus.hpp`） |
+| 纯 GPIO / ADC / TIM | 直调 BSP（参考 `BUTTON` / `NTC_Temperature` / `PWM`） |
+
+### Step 2 — 文件与注册
+
+- 建目录 `<NAME>/`，写 `<name>.hpp` + `<name>.cpp`
+- 头文件**自带所用外设的 BSP 头**（§7.8）—— 不指望工程 `conf.h` 条件带出
+- 在库 `CMakeLists.txt` 的 `LF_LIB_SOURCES` 注册 `.cpp`，并加 include 目录
+- 工程专属配置（引脚 / 地址 / 阻值）**不进库**，走 `lf_config.h`
+- 给一份 `CONFIG_GUIDE.md` 作引导
+
+### Step 3 — 骨架（照抄改）
+
+```cpp
+namespace LoveFinderLib {
+
+class W25Q128 {
+public:
+    /* init 只【绑定】硬件, 不建硬件 —— ATWK 已配好 SPI 参数 */
+    void init(SpiBus &bus, gpio_type *csPort, uint16_t csPin) noexcept
+    {
+        m_bus = &bus;
+        m_cs  = {csPort, csPin};
+        (void)bus.addDevice(m_cs);
+    }
+
+    /* 对外只暴露语义, 不暴露寄存器/字节 */
+    uint32_t readJedecId() noexcept
+    {
+        SpiCsLock lock = m_bus->select(m_cs);
+        if (!lock.held()) return 0;
+
+        uint8_t tx[4] = {0x9F, 0xFF, 0xFF, 0xFF};
+        uint8_t rx[4] = {};
+        if (!spiTransfer(m_bus->spi(), tx, rx, 4)) return 0;
+        return (uint32_t(rx[1]) << 16) | (uint32_t(rx[2]) << 8) | rx[3];
+    }
+
+private:
+    SpiBus *m_bus = nullptr;
+    SpiCs   m_cs{};
+};
+
+} /* namespace LoveFinderLib */
+```
+
+### Step 4 — 几条硬规矩
+
+- **不配总线**：不调 `spi_init` / `i2c_init` / `gpio_pin_mux_config`。
+  设备控制脚（CS / DC / RES / EN）可以自己配一次 —— 那是 §3 的例外，因为纯
+  GPIO 输出不涉复用、初始电平只有驱动知道。
+- **错误处理**：可能失败的操作返回 `bool` / `std::optional` / 状态码。
+  只有在「0 本身就是合法结果」时才可以返回 0 兼作失败（如上面的 JEDEC ID），
+  且要在注释里写明。
+- **等要有界**：轮询超时用 `lf_get_tick()`；要像 SPI 写路径那样无超时忙等，
+  必须在注释里写清理由，并且上层已经接受「时钟没开会卡死」。
+- **RAII 管资源**：片选用 `SpiCsLock`，别手写 `gpio_bits_reset/set` 配对。
+- **实例化**：一块屏 / 一颗芯片一个对象，状态全放成员，**不要文件级 `g_*`**
+  （多实例会互相覆盖 —— ST7735 重构前就踩过）。
+- **注释里的 `*/` 连写**：见 §6 代码规范最后一条。
+
+---
+
+*最后更新: 2026-10-03*（新增 `spi_bus` 总线片选管理并把 ST7735 迁移过去；
+新增 §9 设备驱动编写规范；补 `I2cDevice` 寄存器助手与 BUTTON `attach()`；
+校正 §5 I2C「Bitbang 已删」的错误描述
+—— 前一日：ST7735 实例化 + 取消 48x12 分块；
+新增 SPI 收发 / PWM 模块；TIMER 模块 + BUTTON 双沿；
+SW3538 通路使能与 VBUS 推导）

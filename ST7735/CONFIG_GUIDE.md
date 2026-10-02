@@ -139,9 +139,12 @@ lcd.fillScreen(LoveFinderLib::ST7735::RED);
    - AT32F421：`DMA1_CHANNEL3` 固定映射为 `SPI1_TX`
 3. **无需 DMA 中断**：完成判定轮询 `dtcnt == 0` + `lf_get_tick()` 超时
    （工程 NVIC 未开 DMA 中断，弱定义 handler 无碍）
-4. **句柄绑定是可选的**：`init()` 不传参 = 用 `lf_config.h` 的宏；
-   传了就用传入的（多屏/换 SPI 时各建一个实例即可）
-5. `init()` 内部自配 CS/DC/RES 推挽输出与初始电平
+4. **总线绑定是可选的**：`init()` 不传参 = 本对象自建一条 `SpiBus` 并绑
+   `lf_config.h` 的 `ST7735_SPI`；传 `&spi1` 则挂到外部共用总线
+   （多设备场景，见库 `SPI/spi_bus.hpp`）
+5. `init()` 内部自配 CS/DC/RES 推挽输出与初始电平（设备控制脚，非总线引脚）
+6. **CS 走 `SpiCsLock`（RAII）**：每个绘制操作 `selectCs()` 拉低、析构等空 +
+   拉高；CS 会自动 `addDevice()` 登记到所用总线
 
 ---
 
@@ -155,9 +158,9 @@ namespace app { inline LoveFinderLib::ST7735 g_lcd; }   /* 一屏一实例 */
 
 /* ---- 初始化: 三种绑定力度 ---- */
 g_lcd.init();                                  /* 全用 lf_config.h 的宏 (= 旧行为) */
-g_lcd.init(SPI1);                              /* 只显式绑 SPI 句柄 */
-g_lcd.init(SPI1, DMA1_CHANNEL3, pins, 3);      /* 全套: SPI + DMA + 引脚 + Panel D */
-/*                          ↑ LoveFinderLib::ST7735_PinSet{} 可缺省 */
+g_lcd.init(&spi1);                             /* 挂到共用总线 (多设备场景) */
+g_lcd.init(&spi1, DMA1_CHANNEL3, pins, 3);     /* 全套: 总线 + DMA + 引脚 + Panel D */
+/*                           ↑ LoveFinderLib::ST7735_PinSet{} 可缺省 */
 
 g_lcd.setBacklight(true);
 
@@ -192,7 +195,7 @@ g_lcd.selectPanel(1);   /* B → 随后 g_lcd.init() 才生效 */
 
 | 分类 | 成员函数 |
 |------|----------|
-| 初始化 | `init(spi, dma, pins, panelIdx)` · `isInitialized()` |
+| 初始化 | `init(bus, dma, pins, panelIdx)` · `isInitialized()` |
 | **面板自检** | `panelSelfTest(delayMs)` |
 | 基础绘制 | `drawPixel` `fillRectangle` `fillScreen` `drawImage` |
 | DMA 加速 | `fillRectangleDma` `fillScreenDma` `drawImageDma` |

@@ -14,9 +14,10 @@
  *      select → reset → cmds1 → MADCTL → cmds2 → cmds3 → INVON/INVOFF → deselect
  *
  *  硬件访问【直调 AT32 BSP】(仿 LoveFinderLibForPY32_LL 直调 LL_*):
- *    SPI = m_spi   GPIO = m_csPort/m_dcPort/m_resPort/m_enPort   DMA = m_dma
+ *    SPI 收发 = m_spi (来自 m_bus)      CS = m_cs (经 SpiCsLock, SPI/spi_bus.hpp)
+ *    控制脚 = m_dcPort / m_resPort / m_enPort      DMA = m_dma
  *    延时 = wk_delay_ms (WorkBench)   时基 = lf_get_tick (工程 lf_irq.cpp)
- *  三者全部由 init() 绑定, 不传形参时取 lf_config.h 的 ST7735_* 宏。
+ *  全部由 init() 绑定, 不传形参时取 lf_config.h 的 ST7735_* 宏。
  *
  *  ★ 本文件是【类成员实现】(原 60 个 extern "C" 全局函数已删除, API 只有
  *    实例方法一套)。只读的面板表 / 初始化命令表放在匿名 namespace 供所有
@@ -287,9 +288,9 @@ void ST7735::ensurePins() noexcept
     cfg.gpio_pull           = GPIO_PULL_NONE;
     cfg.gpio_drive_strength = GPIO_DRIVE_STRENGTH_MODERATE;
 
-    cfg.gpio_pins = m_csPin;
-    gpio_init(m_csPort, &cfg);
-    gpio_bits_set(m_csPort, m_csPin);
+    cfg.gpio_pins = m_cs.pin;
+    gpio_init(m_cs.port, &cfg);
+    gpio_bits_set(m_cs.port, m_cs.pin);
 
     cfg.gpio_pins = m_dcPin;
     gpio_init(m_dcPort, &cfg);
@@ -333,13 +334,20 @@ void ST7735::drawGlyph(uint16_t x, uint16_t y, const uint16_t *glyph,
 /*============================================================================
  * 初始化 — 绑定硬件 + 下发屏初始化序列
  *============================================================================*/
-void ST7735::init(spi_type *spi, dma_channel_type *dma,
+void ST7735::init(SpiBus *bus, dma_channel_type *dma,
                   const PinSet &pins, uint8_t panelIdx) noexcept
 {
     /*--------------------------------------------------------------------
-     * 硬件绑定: 形参不给就用 lf_config.h 的宏 (与旧 ST7735_Init 一致)
+     * 总线绑定: 传了 bus 就用它 (可与其他设备共用一条), 否则本对象内建一条
+     * 并绑 ST7735_SPI。形参不给的引脚/面板照旧回落到 lf_config.h 的宏。
      *--------------------------------------------------------------------*/
-    if (spi != nullptr) m_spi = spi;
+    if (bus != nullptr) {
+        m_bus = bus;
+    } else {
+        m_ownBus.init(static_cast<spi_type *>(ST7735_SPI));
+        m_bus = &m_ownBus;
+    }
+    m_spi = m_bus->spi();
 
 #if (ST7735_USE_DMA == 1)
     m_dma = (dma != nullptr) ? dma : static_cast<dma_channel_type *>(ST7735_DMA_CHANNEL);
@@ -347,9 +355,9 @@ void ST7735::init(spi_type *spi, dma_channel_type *dma,
     (void)dma;
 #endif
 
-    if (pins.csPort != nullptr) { m_csPort = pins.csPort;  m_csPin  = pins.csPin;  }
-    else                        { m_csPort = static_cast<gpio_type *>(ST7735_CS_PORT);
-                                  m_csPin  = static_cast<uint16_t>(ST7735_CS_PIN);  }
+    if (pins.csPort != nullptr) { m_cs.port = pins.csPort;  m_cs.pin  = pins.csPin;  }
+    else                        { m_cs.port = static_cast<gpio_type *>(ST7735_CS_PORT);
+                                  m_cs.pin  = static_cast<uint16_t>(ST7735_CS_PIN);  }
 
     if (pins.dcPort != nullptr) { m_dcPort = pins.dcPort;  m_dcPin  = pins.dcPin;  }
     else                        { m_dcPort = static_cast<gpio_type *>(ST7735_DC_PORT);
@@ -369,33 +377,39 @@ void ST7735::init(spi_type *spi, dma_channel_type *dma,
 
     m_panelIdx = panelIdx;
 
+    /* 本屏 CS 登记到所用总线 (releaseAll / 冲突检测用) */
+    (void)m_bus->addDevice(m_cs);
+
     /*--------------------------------------------------------------------
      * 屏初始化序列 (与 491 的 begin() 一致)
      *--------------------------------------------------------------------*/
     ensurePins();
     applyRotation(ST7735_ROTATION);
 
-    csHigh();
+    /* CS 高电平等 50ms (与改动前一致; ensurePins 已把 CS 置高) */
     wk_delay_ms(50);
 
-    /* select → reset */
-    csLow();
-    resetPanel();
+    /* select → reset → 命令表, 全在【一个 CS 周期】内 */
+    {
+        SpiCsLock lock = selectCs();
+        if (!lock.held()) return;   /* 总线被别的设备占着, 放弃本次 init */
 
-    /* cmds1 (末尾含 COLMOD, 不含 MADCTL) */
-    executeCommandList(initCmds1);
+        resetPanel();
 
-    /* MADCTL —— 必须在 cmds1 之后、cmds2 之前 (与 491 begin() 一致) */
-    writeCommand(ST7735::MADCTL);
-    writeData8(rotationCfgOf(m_rotation).madctl);
+        /* cmds1 (末尾含 COLMOD, 不含 MADCTL) */
+        executeCommandList(initCmds1);
 
-    /* cmds2 / cmds3 */
-    executeCommandList(initCmds2);
-    executeCommandList(initCmds3);
+        /* MADCTL —— 必须在 cmds1 之后、cmds2 之前 (与 491 begin() 一致) */
+        writeCommand(ST7735::MADCTL);
+        writeData8(rotationCfgOf(m_rotation).madctl);
 
-    /* 面板反色极性 */
-    writeCommand(kPanels[m_panelIdx].invert ? ST7735::INVON : ST7735::INVOFF);
-    csHigh();
+        /* cmds2 / cmds3 */
+        executeCommandList(initCmds2);
+        executeCommandList(initCmds3);
+
+        /* 面板反色极性 */
+        writeCommand(kPanels[m_panelIdx].invert ? ST7735::INVON : ST7735::INVOFF);
+    }   /* ~lock: 等空 + CS 高 */
 
     m_initialized = true;
 }
@@ -463,13 +477,15 @@ void ST7735::setRotation(uint8_t rotation) noexcept
 
     if (!m_initialized) return;
 
-    csLow();
+    SpiCsLock lock = selectCs();
+    if (!lock.held()) return;
+
     writeCommand(ST7735::MADCTL);
     writeData8(rotationCfgOf(m_rotation).madctl);
     /* 重置整屏窗口到新尺寸 */
     setAddressWindow(0, 0, static_cast<uint16_t>(m_width - 1u),
                             static_cast<uint16_t>(m_height - 1u));
-    csHigh();
+    /* ~lock: 等空 + CS 高 */
 }
 
 void ST7735::selectPanel(uint8_t idx) noexcept
@@ -492,13 +508,14 @@ void ST7735::drawPixel(uint16_t x, uint16_t y, uint16_t color) noexcept
     if (!m_initialized) return;
     if (x >= m_width || y >= m_height) return;
 
-    csLow();
+    SpiCsLock lock = selectCs();
+    if (!lock.held()) return;
+
     setAddressWindow(x, y, x, y);
     dcData();
     spiWriteByte(static_cast<uint8_t>(color >> 8));
     spiWriteByte(static_cast<uint8_t>(color & 0xFFu));
-    spiWaitIdle();
-    csHigh();
+    /* ~lock: spiWaitIdle + CS 高 */
 }
 
 void ST7735::fillRectangle(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) noexcept
@@ -526,7 +543,9 @@ void ST7735::fillRectangle(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint1
      * => 该限制是【模组批次相关】, 不是驱动 / SPI 时序问题, 现按单窗口实现。
      * 若碰到旧批次屏复现"整屏花屏 / 无法通讯", 取回 commit 25b3a95 的分块
      * 实现即可 (本注释上方保留了当时的完整证据链)。 */
-    csLow();
+    SpiCsLock lock = selectCs();
+    if (!lock.held()) return;
+
     setAddressWindow(x, y, static_cast<uint16_t>(x + w - 1u),
                      static_cast<uint16_t>(y + h - 1u));
     dcData();
@@ -535,8 +554,7 @@ void ST7735::fillRectangle(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint1
         spiWriteByte(hi);
         spiWriteByte(lo);
     }
-    spiWaitIdle();
-    csHigh();
+    /* ~lock: spiWaitIdle + CS 高 */
 }
 
 void ST7735::fillScreen(uint16_t color) noexcept
@@ -550,10 +568,12 @@ void ST7735::drawImage(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
     if (!m_initialized || data == nullptr) return;
     if (!clipRect(x, y, w, h)) return;
 
-    csLow();
+    SpiCsLock lock = selectCs();
+    if (!lock.held()) return;
+
     setAddressWindow(x, y, static_cast<uint16_t>(x + w - 1u), static_cast<uint16_t>(y + h - 1u));
     writeData16(data, static_cast<std::size_t>(w) * h);
-    csHigh();
+    /* ~lock: 等空 + CS 高 */
 }
 
 /*============================================================================
@@ -607,7 +627,9 @@ void ST7735::fillRectangleDma(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
     if (!m_initialized) return;
     if (!clipRect(x, y, w, h)) return;
 
-    csLow();
+    SpiCsLock lock = selectCs();
+    if (!lock.held()) return;
+
     setAddressWindow(x, y, static_cast<uint16_t>(x + w - 1u), static_cast<uint16_t>(y + h - 1u));
 
     const uint8_t hi = static_cast<uint8_t>(color >> 8);
@@ -624,8 +646,7 @@ void ST7735::fillRectangleDma(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
             spiWriteBlock(m_rowBuf, rowBytes);
         }
     }
-    spiWaitIdle();
-    csHigh();
+    /* ~lock: spiWaitIdle + CS 高 */
 #endif
 }
 
@@ -643,7 +664,9 @@ void ST7735::drawImageDma(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
     if (!m_initialized || data == nullptr) return;
     if (!clipRect(x, y, w, h)) return;
 
-    csLow();
+    SpiCsLock lock = selectCs();
+    if (!lock.held()) return;
+
     setAddressWindow(x, y, static_cast<uint16_t>(x + w - 1u), static_cast<uint16_t>(y + h - 1u));
 
     dcData();
@@ -658,8 +681,7 @@ void ST7735::drawImageDma(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
             spiWriteBlock(m_rowBuf, rowBytes);
         }
     }
-    spiWaitIdle();
-    csHigh();
+    /* ~lock: spiWaitIdle + CS 高 */
 #endif
 }
 
