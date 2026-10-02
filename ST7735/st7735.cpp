@@ -513,47 +513,32 @@ void ST7735::fillRectangle(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint1
     const uint8_t hi = static_cast<uint8_t>(color >> 8);
     const uint8_t lo = static_cast<uint8_t>(color & 0xFFu);
 
-    /* 分块填充 —— 修复【大地址窗口写入出错】。
+    /* 单个地址窗口一次发完 —— 【不按 48x12 分块】。
      *
-     * 证据链 (本工程实测, 单变量逐项排除):
+     * 历史记录 (旧批次屏实测, 保留作对照):
      *   - DrawPixel(1x1 窗口) 文字            -> 正常
      *   - FillRectangle(48x12 窗口) 蓝条       -> 正常
      *   - FillRectangle(160x80 窗口) 整屏      -> 必花屏, 且两种数据方式都花:
      *       * 整块一次性连续发 25600 字节      -> 花屏
      *       * 单窗口 + 按行分段发(每行等移位清空)-> 仍花屏
      *   - 降速到 1.875MHz (甚至更低)           -> 无效, 与 SPI 速度无关
-     * => 数据是否分段无关, 决定性变量是【单个地址窗口的尺寸】:
-     *    <=48x12 的小窗口写入正常, 160x80 大窗口写入出错。
+     * => 旧批次的决定性变量是【单个地址窗口的尺寸】: >48x12 就出错。
+     *   当时的对策是切成 48x12 小块, 每块独立 CS -> 小窗口 -> 数据 -> CS。
      *
-     * 故把大矩形切成 48x12 小块(= 已被蓝条验证可用的尺寸), 每块独立
-     * csLow -> 设小窗口 -> 发数据 -> csHigh, 使任何一次窗口都处于可用量级。
-     * (与 491 参考库的"单窗口 + 逐行"不同: 491 的屏能吃大窗口, 本屏不能,
-     *   以本屏实测为准。) */
-    constexpr uint16_t kTileW = 48;
-    constexpr uint16_t kTileH = 12;
-
-    for (uint16_t ty = 0; ty < h; ty = static_cast<uint16_t>(ty + kTileH)) {
-        const uint16_t bh = (static_cast<uint16_t>(h - ty) < kTileH)
-                          ? static_cast<uint16_t>(h - ty) : kTileH;
-        for (uint16_t tx = 0; tx < w; tx = static_cast<uint16_t>(tx + kTileW)) {
-            const uint16_t bw = (static_cast<uint16_t>(w - tx) < kTileW)
-                              ? static_cast<uint16_t>(w - tx) : kTileW;
-
-            csLow();
-            setAddressWindow(static_cast<uint16_t>(x + tx),
-                             static_cast<uint16_t>(y + ty),
-                             static_cast<uint16_t>(x + tx + bw - 1u),
-                             static_cast<uint16_t>(y + ty + bh - 1u));
-            dcData();
-            const uint32_t pixels = static_cast<uint32_t>(bw) * bh;
-            for (uint32_t i = 0; i < pixels; ++i) {
-                spiWriteByte(hi);
-                spiWriteByte(lo);
-            }
-            spiWaitIdle();
-            csHigh();
-        }
+     * 2026-10-02 实验: 换了一批模组, 按用户要求【取消该限制】走单窗口。
+     * 若新屏复现"整屏花屏 / 无法通讯", 从 git 取回分块实现
+     * (commit 25b3a95 之前的版本) 即可回退。 */
+    csLow();
+    setAddressWindow(x, y, static_cast<uint16_t>(x + w - 1u),
+                     static_cast<uint16_t>(y + h - 1u));
+    dcData();
+    const uint32_t pixels = static_cast<uint32_t>(w) * h;
+    for (uint32_t i = 0; i < pixels; ++i) {
+        spiWriteByte(hi);
+        spiWriteByte(lo);
     }
+    spiWaitIdle();
+    csHigh();
 }
 
 void ST7735::fillScreen(uint16_t color) noexcept
