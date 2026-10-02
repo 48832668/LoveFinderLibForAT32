@@ -70,6 +70,10 @@
 #include "at32f421_gpio.h"   /* gpio_type / gpio_bits_set / gpio_bits_reset */
 #include "at32f421_dma.h"    /* dma_channel_type / dma_channel_enable */
 
+/* ★ SPI 字节收发转调库通用模块 (SPI/spi_io.cpp) —— 本类只管 CS/DC/面板/像素,
+ *   不再自带一份 TDBE 忙等实现, 避免两处 SPI 读写代码各自演化分叉。 */
+#include "spi_io.hpp"
+
 #include "wk_system.h"      /* wk_delay_ms/µs — WorkBench BSP (仿 PY32 的 LL_mDelay) */
 #include "font.h"           /* FontDef + 字体名册 + font_get_glyph* (PickSoul 生成) */
 
@@ -379,6 +383,10 @@ private:
     void dcCommand() noexcept { gpio_bits_reset(m_dcPort, m_dcPin); }
     void dcData()    noexcept { gpio_bits_set(m_dcPort, m_dcPin); }
 
+    /* 三个 SPI 原语是【薄包装】, 实现转调 SPI/spi_io 的自由函数。
+       保留成员形式是内部调用点不必逐个改签名, 将来换另一路 SPI 也零改动。
+       注意实现里必须写 LoveFinderLib:: 限定名 —— 不限定会先命中本成员
+       (参数不匹配直接报错, 不会回落到外层命名空间)。 */
     void spiWriteByte(uint8_t b) noexcept;     /* 等 TDBE → 写数据寄存器 */
     void spiWaitIdle() noexcept;               /* 等移位寄存器空, 翻 CS 前必须 */
     void spiWriteBlock(const uint8_t *data, uint16_t len) noexcept;

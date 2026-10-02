@@ -156,30 +156,26 @@ void ST7735::applyRotation(uint8_t rot) noexcept
 }
 
 /*============================================================================
- * 底层原语 — 直调 AT32 BSP (对应 PY32 库直调 LL_SPI_ / LL_GPIO_ 系列)
+ * 底层原语 — 转调库通用 SPI 收发 (SPI/spi_io.cpp), 本类只管 CS/DC/面板
+ *
+ * 行为与改动前逐位一致: 忙等 TDBE、不查超时、只写不 drain 接收缓冲。
+ * 详见 spi_io.hpp 头部说明 (含「写不超时 / 读超时」的取舍理由)。
  *============================================================================*/
 void ST7735::spiWriteByte(uint8_t b) noexcept
 {
-    while (spi_i2s_flag_get(m_spi, SPI_I2S_TDBE_FLAG) == RESET) {
-        /* busy wait —— 前提: wk_spi1_init() 已完成, SPI 时钟已开 */
-    }
-    spi_i2s_data_transmit(m_spi, b);
+    /* ★ 必须限定命名空间: 否则先命中本成员 (参数不匹配报错) */
+    LoveFinderLib::spiWriteByte(m_spi, b);
 }
 
 /** 等 SPI 移位寄存器彻底空 —— 翻 CS 前必须等, 否则截断最后一字节。 */
 void ST7735::spiWaitIdle() noexcept
 {
-    while (spi_i2s_flag_get(m_spi, SPI_I2S_BF_FLAG) != RESET) {
-        /* busy wait */
-    }
+    LoveFinderLib::spiWaitIdle(m_spi);
 }
 
 void ST7735::spiWriteBlock(const uint8_t *data, uint16_t len) noexcept
 {
-    for (uint16_t i = 0; i < len; ++i) {
-        spiWriteByte(data[i]);
-    }
-    spiWaitIdle();
+    LoveFinderLib::spiWriteBlock(m_spi, data, len);
 }
 
 void ST7735::writeCommand(uint8_t cmd) noexcept

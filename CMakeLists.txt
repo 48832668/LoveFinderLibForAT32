@@ -27,6 +27,12 @@ set(LF_LIB_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/I2C/i2c_master.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/I2C/i2c_sw.cpp
 
+    # ---- SPI 收发 (阻塞式, 直绑 spi_type; 只收发, 初始化归 ATWK) ----
+    ${CMAKE_CURRENT_SOURCE_DIR}/SPI/spi_io.cpp
+
+    # ---- PWM 占空比调整 (只写 CCR, 初始化归 ATWK) ----
+    ${CMAKE_CURRENT_SOURCE_DIR}/PWM/pwm.cpp
+
     # ---- 按键 ----
     ${CMAKE_CURRENT_SOURCE_DIR}/BUTTON/BUTTON.cpp
 
@@ -99,6 +105,8 @@ add_library(lovefinder_lib STATIC
 target_include_directories(lovefinder_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/I2C
+    ${CMAKE_CURRENT_SOURCE_DIR}/SPI
+    ${CMAKE_CURRENT_SOURCE_DIR}/PWM
     ${CMAKE_CURRENT_SOURCE_DIR}/BUTTON
     ${CMAKE_CURRENT_SOURCE_DIR}/TIMER
     ${CMAKE_CURRENT_SOURCE_DIR}/SW3526

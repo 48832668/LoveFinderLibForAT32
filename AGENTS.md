@@ -34,6 +34,8 @@ LoveFinderLibForAT32\
 ├── PROJECT_SUMMARY.md          #   交付清单与验证结果
 │
 ├── I2C\                        # 阻塞式硬件 I2C 主机 (i2c_master 自由函数)
+├── SPI\                        # 阻塞式硬件 SPI 收发 (spi_io 自由函数, 初始化归 ATWK)
+├── PWM\                        # TMR 占空比调整 (只写 CCR, 初始化归 ATWK)
 ├── BUTTON\                     # 按键: 单击 / 双击 / 长按 + 充能 (EXINT 上下沿, ISR 只置标志)
 ├── TIMER\                      # 可选的 TIM 毫秒时基 (按键脱离 SysTick 时才用)
 ├── SW3526\                     # SW3526S 快充控制器 (I2C)
@@ -202,6 +204,56 @@ std::optional<uint8_t> v = i2cReadReg8(I2C1, 0x3C, reg, 100);
 repeated START（规范寄存器读时序）。**软件 Bitbang 后端已随平台层删除**
 （无工程使用；将来需要时在 `I2C/` 下新增实现）。
 `i2cMasterRecover()` 只做外设软复位，GPIO 级 9 脉冲恢复由应用层自行实现。
+
+### SPI — 阻塞式硬件 SPI 收发
+
+```cpp
+using namespace LoveFinderLib;
+csLow();
+spiWriteByte(SPI1, 0x2A);
+spiWriteBlock(SPI1, frame, sizeof frame);
+spiWaitIdle(SPI1);                       // 翻 CS 前必须
+csHigh();
+
+uint8_t id[3];
+if (spiReadBlock(SPI1, id, 3)) { ... }   // 读: 发 0xFF dummy, false = 超时
+```
+
+**初始化归 ATWK，库只搬字节** —— 不调 `spi_init`/`gpio_init`，运行中也不改
+任何 SPI 硬件参数（ATWK 设成什么样就按什么样收发）；实例由调用方传
+`spi_type*`。**CS 不归本模块管**（ST7735 有自己的 `csLow`/`csHigh`），
+调用顺序由设备驱动负责。
+
+- **写路径**（`spiWriteByte`/`spiWriteBlock`/`spiWaitIdle`）**忙等不查超时** ——
+  与 `st7735.cpp` 已上板实现逐位一致，且热路径逐字节调 `lf_get_tick()` 会让
+  160x80 整屏多出 25600 次函数调用。代价是 SPI 时钟没开时会永久忙等（看门狗
+  /硬件问题，靠驱动层超时兜不住）。
+- **读路径**（`spiReadBlock`/`spiTransfer`/`spiDrainRx`）**带超时** —— 从机可能
+  根本不回数据，必须有界；进函数先 drain 残留并清 ROERR。
+- 只写不读时累积的 RDBF/ROERR **正常且无害**（AT32 只用它们管接收），
+  实测 ST7735 全程只写含整屏 DMA，上板正常。
+
+⚠ **ST7735 的三个 SPI 原语已改为转调本模块**（薄包装，实现单一来源）。
+转调处必须写 `LoveFinderLib::` 限定名 —— 不限定会先命中类内成员，
+参数不匹配直接报错，不会回落到外层命名空间。
+未被引用的读函数经 `-ffunction-sections` + `--gc-sections` 被丢弃（nm 可确认）。
+
+### PWM — 占空比调整
+
+```cpp
+using namespace LoveFinderLib;
+pwmSetPercent(TMR3, TMR_SELECT_CHANNEL_2, 30);      // 30%
+pwmSetPermille(TMR3, TMR_SELECT_CHANNEL_2, 750);    // 呼吸灯细粒度
+pwmSetDuty(TMR3, TMR_SELECT_CHANNEL_2, 500);        // 直接给 ticks
+```
+
+**初始化归 ATWK** —— 库只写 CCR 比较寄存器，不碰 ARR/PSC/引脚复用/通道模式。
+周期**不是库持有的配置**：`pwmSetPercent`/`pwmSetPermille` 每次运行时用
+`tmr_period_value_get()` 读当前 ARR，ATWK 改了周期会自动跟上，不会出现
+"库里的常量与实际周期对不上"。`pwmSetDuty` 把 value 钳到 `[0, period]`。
+
+⚠ **208 目前无调用方**（LED1 呼吸灯尚未实现），只有编译验证；
+上板验证待真正接入呼吸灯时补，接入时记得连调用方一起测。
 
 ### SW3526 — 快充控制器
 
@@ -456,14 +508,23 @@ $tc  = "C:\Users\ZWDX_LKJ\AppData\Local\at32-tools"
 改库后三个工程都要编一遍（2026-10-02 改 BUTTON/TIMER 即按此验证）。
 
 > ⚠ **2026-10-02 ST7735 实例化重构后**：只有 **208** 迁移到实例 API ——
-> 零警告，FLASH **55 440 B / 84.59%**、RAM **5 600 B / 34.18%**；
 > 随后**取消 48x12 分块、改走整屏单窗口，上板验证通过**（开屏页 160x80 整屏
 > 背景无花屏，见 §5 ST7735）。
 > **907 / 891 仍调用已删除的 `extern "C"` 旧函数，当前编不过** ——
 > 按用户指示由各工程自行迁移，不代改。
+>
+> **2026-10-02 新增 SPI / PWM 模块**（分工: 初始化归 ATWK，库只做读写，
+> 见 §5 SPI、§5 PWM）：208 零警告，FLASH **55 536 B / 84.74%**、
+> RAM **5 600 B / 34.18%**（上一步 55 440 B / 84.59%）。
+> 增量 96 B 来自 ST7735 三个原语改成薄包装后多出的间接层；
+> **未被引用的 `spiReadBlock`/`spiTransfer` 与整个 `pwm.cpp` 经
+> `-ffunction-sections` + `--gc-sections` 丢弃，nm 查不到符号 = 零成本**。
+> ⚠ PWM 只有编译验证（208 无调用方），上板验证待接入呼吸灯后补。
 
 ---
 
-*最后更新: 2026-10-02*（ST7735 改为实例化 API，删除 60 个 `extern "C"` 全局函数；
+*最后更新: 2026-10-02*（ST7735 改为实例化 API，删除 60 个 `extern "C"` 全局函数，
+并取消 48x12 分块改走整屏单窗口（上板验证）；
+新增 SPI 收发 / PWM 占空比两个模块 —— 初始化全部归 ATWK，库只做读写；
 新增 TIMER 模块 + BUTTON 双沿/纯标志中断/可选时基；
-SW3538 加通路使能 init 形参与 VBUS 推导）
+SW3538 加通路使能 init 形参与 VBUS 推导（上板验证））
