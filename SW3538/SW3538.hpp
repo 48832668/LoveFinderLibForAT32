@@ -140,6 +140,7 @@ enum class e_SW3538_FastProt : uint8_t {
     PE20    = 9,
     VOOC10  = 10,
     VOOC40  = 11,
+    FAST    = 12,       ///< 原枚举缺号; 手册未列 (待核对), 显示 "FAST"
     SFCP    = 13,
     AFC     = 14,
     TFCP    = 15,

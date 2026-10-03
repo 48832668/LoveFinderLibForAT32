@@ -257,6 +257,7 @@ const char *SW3538::getProtocolName(e_SW3538_FastProt prot)
     case e_SW3538_FastProt::PE20:   return "PE2";
     case e_SW3538_FastProt::VOOC10: return "VOOC";
     case e_SW3538_FastProt::VOOC40: return "VOOC";
+    case e_SW3538_FastProt::FAST:   return "FAST";
     case e_SW3538_FastProt::SFCP:   return "SFCP";
     case e_SW3538_FastProt::AFC:    return "AFC";
     case e_SW3538_FastProt::TFCP:   return "TFCP";
