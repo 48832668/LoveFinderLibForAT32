@@ -1,0 +1,30 @@
+# ==== 构建产物 ====
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.a
+*.elf
+*.map
+*.hex
+*.bin
+*.d
+*.lst
+
+# ==== 备份 / 临时 ====
+# 库目录里不要出现 *.bak —— 备份靠 git 提交, 不靠副本。
+# (FontLib 下曾漏进 font.h.bak / font_data.cpp.bak / font_manifest.json.bak)
+*.bak
+*.log
+*.tmp
+*.cache
+__pycache__/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ==== 说明 ====
+# 本库不给自己加 .gitignore 之外的忽略项:
+# 工程专属配置 (lf_config.h / fonts_config.hpp) 本来就不进库, 见 AGENTS.md §3。
