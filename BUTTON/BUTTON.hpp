@@ -12,16 +12,26 @@
  *  - 事件计数与标志位 (两种消费风格)
  *
  * ============================================================================
- *  两段式中断模型 —— ★ 中断里只碰 flag, 一个判定都不做
+ *  两段式模型 —— ★ 中断里只碰 flag, 判定集中在状态机一步里
  * ============================================================================
  *  EXINT 中断 → onExti()  :  ① 清 EXINT 挂起标志
  *                            ② 读一次电平, 认出这是「按下沿」还是「释放沿」
  *                            ③ 记下边沿时刻
  *                            —— 仅此三步, 全是 volatile flag / 时间戳。
- *  主循环     → update()  :  消抖、单击/双击/长按判定、充能衰减,
+ *  状态机一步 → update() / tickIsr()  :
+ *                            消抖、单击/双击/长按判定、充能衰减,
  *                            全部基于上面那些 flag + 电平轮询兜底。
+ *                            ★ 两者是【同一个状态机】, 只是调用位置不同:
+ *                              · 主循环模式: 主循环里调 update() (返回事件)
+ *                              · 中断模式  : 周期性中断里调 tickIsr() ——
+ *                                判定完全不依赖主循环, 主循环长阻塞也不丢按键
+ *  事件读取   → getEvent() / getAndClearFlags() / getCounter()
  *
- *  断言不变式: 除了 pushEvent(), 状态机只在 update() 里推进。
+ *  断言不变式:
+ *    ① 除了 pushEvent(), 状态机只在 update() / tickIsr() 里推进;
+ *    ② onExti() 与状态机之间用【快照】交接 —— 读标志 + 清标志 + 取边沿时刻
+ *       整段放进临界区, 所以两侧放主循环还是中断都安全, 不会丢沿;
+ *    ③ 事件读取 (getEvent / getAndClearFlags) 也带临界区, 可与中断并存。
  *
  * ============================================================================
  *  时基 (★ 可选 SysTick / 一路 TIM)
@@ -172,6 +182,14 @@ struct BUTTON_Counter {
     std::uint32_t longPressCount   = 0;
 };
 
+/** onExti() 置的待处理沿 + 对应边沿时刻 —— 由 takeIsrEdges() 原子取走。
+ *  (三样一起读、一起清, 所以不会出现「标志拿到了但时刻被下一次边沿盖掉」) */
+struct BUTTON_IsrEdges {
+    bool          press   = false;   ///< 有按下沿待处理
+    bool          release = false;   ///< 有释放沿待处理
+    std::uint32_t tick    = 0;       ///< 最后一次边沿的时刻 (与上面两个标志同批)
+};
+
 /*============================================================================
  * Button
  *============================================================================*/
@@ -261,9 +279,23 @@ public:
         m_flags              = 0;
     }
 
-    /*---------- 主循环接口 ----------*/
-    /** 在主循环中定期调用 (建议 1~10ms)。返回本次产生的事件。 */
+    /*---------- 状态机 (二选一: 主循环 或 周期性中断) ----------*/
+    /** 推进一次状态机, 返回本次产生的事件。
+     *  【主循环模式】在主循环里定期调用 (建议 1~10ms)。
+     *  中断里也能调, 但中断模式请用语义更明确的 tickIsr()。 */
     e_BUTTON_Event update() noexcept;
+
+    /** 推进一次状态机, 不返回事件 —— 【中断模式】专用。
+     *
+     *  在周期性中断里调用 (建议 1~10ms, 例如 1ms 的 SysTick)。
+     *  判定从此完全脱离主循环: 主循环哪怕阻塞几百 ms, 消抖 / 双击窗口 /
+     *  长按计时照样按真实时间推进。
+     *
+     *  ★ 事件不再靠返回值拿 (中断里没法把返回值交给别人)。请在主循环用
+     *    getEvent() / getAndClearFlags() / getCounter() 读取, 都带临界区。
+     *  ★ 别和 update() 混用同一实例: 两者是同一个状态机, 两个地方一起驱动
+     *    会让时间判定乱掉。中断模式就只在中断里调 tickIsr()。 */
+    void tickIsr() noexcept { (void)update(); }
 
     [[nodiscard]] bool hasEvent() const noexcept { return m_hasEvent; }
 
@@ -287,12 +319,8 @@ public:
     {
         return (m_flags & static_cast<std::uint8_t>(f)) != 0u;
     }
-    std::uint8_t getAndClearFlags() noexcept
-    {
-        const std::uint8_t f = m_flags;
-        m_flags = 0;
-        return f;
-    }
+    /** 取走并清除全部事件标志位 (临界区内读+清, 可与中断并存)。 */
+    std::uint8_t getAndClearFlags() noexcept;
     void clearFlags() noexcept { m_flags = 0; }
 
     /*---------- 物理状态 ----------*/
@@ -378,6 +406,9 @@ private:
     volatile std::uint8_t   m_flags     = 0;
 
     void pushEvent(e_BUTTON_Event e) noexcept;
+    /** 原子取走 onExti() 置的待处理沿 + 边沿时刻 (临界区内读清)。
+     *  状态机每一步开头调一次, 之后整步都用这份快照。 */
+    BUTTON_IsrEdges takeIsrEdges() noexcept;
     void updateCharge(std::uint32_t now) noexcept;
     /** 释放消抖窗结束后提交释放 (RELEASE 事件 + 状态迁移 + 按压时长)。 */
     e_BUTTON_Event commitRelease(std::uint32_t now) noexcept;

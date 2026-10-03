@@ -2,7 +2,8 @@
  * @file    BUTTON.cpp
  * @brief   按键驱动实现 — C++17 (LoveFinderLibForAT32)
  *
- * 状态机 (全部在主循环 update() 里推进; 中断只置 flag):
+ * 状态机 (在 update() / tickIsr() 里推进 —— 二选一: 主循环 或 周期性中断;
+ *         EXINT 中断里只置 flag, 不做任何判定):
  *
  *   IDLE ──(按下沿 flag)──> DEBOUNCE ──(消抖后仍按下)──> PRESSED
  *                              │                            │
@@ -22,6 +23,7 @@
 #include "at32f421_exint.h"
 #include "at32f421_scfg.h"
 #include "at32f421_misc.h"
+#include "at32f421.h"     /* ★ __get_PRIMASK / __disable_irq (临界区, 见下) */
 
 #if BUTTON_TIMEBASE_TIMER
 #include "TIMER.hpp"      /* BUTTON_TIMEBASE_TIMER=1 时, 按键时基改用 TIMER 模块 */
@@ -83,6 +85,27 @@ IRQn_Type irqOfPin(std::uint8_t n) noexcept
     if (n <= 1u)  return EXINT1_0_IRQn;
     if (n <= 3u)  return EXINT3_2_IRQn;
     return EXINT15_4_IRQn;
+}
+
+/*----------------------------------------------------------------------------
+ * 临界区 —— onExti() 与状态机之间交接标志用
+ *
+ * 保存 PRIMASK 再关中断, 退出时【还原到进入前的状态】:
+ *   · 主循环里调 → 短暂关中断后恢复为「开」
+ *   · 中断里调   → 本来就处于关中断, 还原后仍是关 → 不会误开中断
+ * 所以同一段代码放主循环或中断都安全 (这也是 update()/tickIsr() 能通用
+ * 于两种模式的前提)。临界区里只做几个字节的读改写, 纳秒级。
+ *----------------------------------------------------------------------------*/
+std::uint32_t criticalEnter() noexcept
+{
+    const std::uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    return primask;
+}
+
+void criticalExit(std::uint32_t primask) noexcept
+{
+    __set_PRIMASK(primask);
 }
 
 } // namespace
@@ -157,7 +180,26 @@ void Button::onExti() noexcept
 }
 
 /*============================================================================
- * 事件推送
+ * 中断 ↔ 状态机 交接 (整个读+清在临界区里, 两侧放哪都安全)
+ *============================================================================*/
+BUTTON_IsrEdges Button::takeIsrEdges() noexcept
+{
+    const std::uint32_t primask = criticalEnter();
+
+    BUTTON_IsrEdges e;
+    e.press   = m_pressPending;
+    e.release = m_releasePending;
+    e.tick    = m_isrTick;
+
+    m_pressPending   = false;
+    m_releasePending = false;
+
+    criticalExit(primask);
+    return e;
+}
+
+/*============================================================================
+ * 事件推送 / 读取
  *============================================================================*/
 void Button::pushEvent(e_BUTTON_Event e) noexcept
 {
@@ -168,10 +210,21 @@ void Button::pushEvent(e_BUTTON_Event e) noexcept
 
 e_BUTTON_Event Button::getEvent() noexcept
 {
+    const std::uint32_t primask = criticalEnter();
     const e_BUTTON_Event e = m_lastEvent;
     m_lastEvent = e_BUTTON_Event::NONE;
     m_hasEvent  = false;
+    criticalExit(primask);
     return e;
+}
+
+std::uint8_t Button::getAndClearFlags() noexcept
+{
+    const std::uint32_t primask = criticalEnter();
+    const std::uint8_t f = m_flags;
+    m_flags = 0;
+    criticalExit(primask);
+    return f;
 }
 
 /*============================================================================
@@ -180,6 +233,13 @@ e_BUTTON_Event Button::getEvent() noexcept
 e_BUTTON_Event Button::update() noexcept
 {
     const std::uint32_t now = buttonNow();   /* 与 onExti() 记的边沿时刻同源 */
+
+    /* ★ 每一步开头把中断置的沿【整批取走】: 读标志 + 清标志 + 取边沿时刻
+     *   全在临界区内一次做完。之后整步都用这份快照 —— onExti() 在任意时刻
+     *   插入都不会丢沿, 也不会出现「标志拿到了但时刻被下一次边沿盖掉」。
+     *   状态机里因此【不再】出现 m_pressPending / m_releasePending 的赋值。 */
+    const BUTTON_IsrEdges isr = takeIsrEdges();
+
     e_BUTTON_Event event = e_BUTTON_Event::NONE;
 
     switch (m_state) {
@@ -187,8 +247,7 @@ e_BUTTON_Event Button::update() noexcept
      * IDLE: 等待中断置位
      *----------------------------------------------------------------*/
     case e_BUTTON_State::IDLE:
-        if (m_pressPending) {
-            m_pressPending = false;
+        if (isr.press) {
             m_state        = e_BUTTON_State::DEBOUNCE;
             m_debounceTick = now;
         }
@@ -199,12 +258,9 @@ e_BUTTON_Event Button::update() noexcept
      *----------------------------------------------------------------*/
     case e_BUTTON_State::DEBOUNCE:
         if ((now - m_debounceTick) >= m_config.debounceMs) {
-            m_pressPending = false;
-
             if (isPressed()) {
-                /* 确认按下 (此刻电平是按下, 之前残留的释放沿一律作废) */
+                /* 确认按下 (此刻电平是按下; 消抖窗内的抖动沿已被快照整批丢掉) */
                 m_state          = e_BUTTON_State::PRESSED;
-                m_releasePending = false;
                 m_pressTime      = now;
                 m_longPressFired = false;
                 m_longPressActive = false;
@@ -238,11 +294,7 @@ e_BUTTON_Event Button::update() noexcept
      * 窗内若电平又按回去 → 取消, 继续算按住; 稳定 debounceMs 才提交释放。
      *----------------------------------------------------------------*/
     case e_BUTTON_State::PRESSED: {
-        bool releaseEdge = false;
-        if (m_releasePending) {
-            m_releasePending = false;
-            releaseEdge      = true;
-        }
+        const bool releaseEdge = isr.release;   /* 快照里的释放沿 */
 
         if (m_releaseWait) {
             if (isPressed()) {
@@ -255,7 +307,7 @@ e_BUTTON_Event Button::update() noexcept
 
         if (releaseEdge || !isPressed()) {
             m_releaseWait  = true;                        /* 起释放消抖窗 */
-            m_releaseTick  = releaseEdge ? m_isrTick : now;
+            m_releaseTick  = releaseEdge ? isr.tick : now;
             m_debounceTick = now;
             if (isPressed()) m_releaseWait = false;       /* 沿到时已回弹 → 不算释放 */
             break;
@@ -277,9 +329,8 @@ e_BUTTON_Event Button::update() noexcept
      * WAIT_CLICK: 双击判定窗口
      *----------------------------------------------------------------*/
     case e_BUTTON_State::WAIT_CLICK:
-        if (m_pressPending) {
+        if (isr.press) {
             /* 窗口内又按下 → 可能是双击, 走消抖 */
-            m_pressPending       = false;
             m_waitingSecondClick = true;
             m_state              = e_BUTTON_State::DEBOUNCE;
             m_debounceTick       = now;
@@ -315,8 +366,9 @@ e_BUTTON_Event Button::commitRelease(std::uint32_t now) noexcept
 
     m_longPressActive = false;
     m_decayTick       = now;
-    m_pressPending    = false;
     m_releaseWait     = false;
+    /* 注意: 这里【不再】清 m_pressPending —— 释放消抖窗内真来了第二次按下,
+     * 那是双击的第二下, 应该留给下一拍 WAIT_CLICK 处理, 而不是丢掉。 */
 
     if (m_longPressFired) {
         m_state = e_BUTTON_State::IDLE;          /* 长按后释放: 不再产生单击 */

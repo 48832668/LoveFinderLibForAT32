@@ -176,13 +176,22 @@ key.init(BUTTON_KEY_PORT, BUTTON_KEY_PIN);
    输入+上拉 + EXINT 上下沿都触发 + NVIC 使能; 本类不写任何硬件寄存器 */
 key.attach(BUTTON_KEY_PORT, BUTTON_KEY_PIN);
 
-/* EXINT 中: key.onExti();   主循环 5ms: switch(key.update()) {...} */
+/* EXINT 中断里: key.onExti();     —— 只置标志, 不判定 */
+
+/* 判定位置【二选一】: */
+/* (A) 主循环模式 —— 主循环每 1~10ms 调一次, 用返回值拿事件 */
+const auto ev = key.update();
+if (ev != LoveFinderLib::e_BUTTON_Event::NONE) { ... }
+
+/* (B) 中断模式 (推荐, 判定 0 主循环依赖) —— 周期性中断里调 tickIsr() */
+void MyTickIsr(void) { key.tickIsr(); }      /* 例如 1ms 的 SysTick */
+const auto ev2 = key.getEvent();             /* 主循环只负责取事件 */
 ```
 
 **两种绑定方式的差别只有「谁配 EXINT」**：`init()` 自己配 GPIO/SCFG/EXINT/NVIC；
 `attach()` 全留给 ATWK，本类只做语义（消抖 / 长按 / 双击 / 充能）。
 ⚠ `attach()` 下 ATWK **必须把 EXINT 配成上下沿都触发**，否则释放沿认不出，
-长按/双击的时刻精度会降（功能仍能用，靠 `update()` 轮询兜底）。
+长按/双击的时刻精度会降（功能仍能用，靠电平轮询兜底）。
 
 EXINT 配置（输入+上拉 → SCFG 线绑定 → 触发沿 → NVIC 分组中断）已内联在
 `BUTTON.cpp` 的 `configureExti()`（**仅在 `init()` 路径调用**）。状态机：
@@ -191,17 +200,40 @@ EXINT 配置（输入+上拉 → SCFG 线绑定 → 触发沿 → NVIC 分组中
 **工程必须定义对应 EXINT 分组中断并在其中调 `onExti()`**（否则按键触发即进
 弱定义死循环）。
 
-**两段式中断模型（改这个驱动时必须守住的边界）**：
+**两段式模型（改这个驱动时必须守住的边界）**：
 
 - `onExti()` **只置标志** —— 清挂起位 → 读一次电平辨认「按下沿 / 释放沿」
   → 记 `buttonNow()` 时间戳。不做消抖、不改状态机。
-- `update()` 在主循环里做全部判定，标志没来时用电平轮询兜底。
+- 状态机一步 = `update()` / `tickIsr()` —— **同一个状态机**, 只是调用位置不同：
+  消抖、单击/双击/长按判定、充能；标志没来时用电平轮询兜底。
+  ⚠ **别在同一个实例上同时用两者**，会让时间判定乱掉。
+- **中断交界用快照交接**（2026-10-03 起）：状态机每步开头调 `takeIsrEdges()`,
+  在**临界区**（保存/还原 PRIMASK）里一次读完 `press`/`release` 标志 + 边沿时刻
+  并清标志。所以 `onExti()` 在任意时刻插入都**不会丢沿**，也不会出现
+  「标志拿到了但时刻被下一次边沿盖掉」。`getEvent()` / `getAndClearFlags()`
+  同样带临界区。**这就是 `update()`/`tickIsr()` 放主循环或中断都安全的原因。**
+  状态机内部因此**不再**出现 `m_pressPending` / `m_releasePending` 的赋值。
 - EXINT 默认 `EXINT_TRIGGER_BOTH_EDGE`（上下沿都触发，`bothEdges` 可关回单沿）。
-  按下沿 → `m_pressPending`（唤醒状态机）；释放沿 → `m_releasePending`
+  按下沿 → `m_pressPending`；释放沿 → `m_releasePending`
   （起**释放消抖窗**：电平稳定 `debounceMs` 才提交 `RELEASE`，回弹则取消）。
 - 时基走 `buttonNow()`：默认 `lf_get_tick()`；`BUTTON_TIMEBASE_TIMER=1` 时改读
-  TIMER 模块的 `timerNow()`（起失败自动退回 `lf_get_tick()`）。
+  TIMER 模块的 `timerNow()`。
 - 只有 `app_nav` 这类消费方**不受影响**：`RELEASE` 会比旧版晚约 `debounceMs`。
+
+**中断模式的收益 / 代价**（208 已采用，2026-10-03）：
+
+| | 主循环模式 | 中断模式 |
+|---|---|---|
+| 判定依赖主循环频率 | 是（但判定基于时间戳，晚点跑也算得对） | **否** |
+| 主循环长阻塞几百 ms | 那期间的判定等阻塞结束才发生 | **照真实时间推进，事件不丢** |
+| 事件怎么拿 | `update()` 返回值 / flags | `getEvent()` / flags / counter |
+| 额外中断 | 无 | 借用已有的 SysTick → **零额外中断** |
+
+> 208 的做法：1ms SysTick 同时做时基 + 状态机
+> （`lf_irq_tick()` → `lf_app_button_tick()` → `g_key.tickIsr()`），
+> 主循环只 `getEvent()`。顺带把 `BUTTON_TIMEBASE_TIMER` 从 1 改回 0，
+> TMR6 那条链路整个被回收（**Flash 省 564 B、每秒少 100 次中断**，
+> 且分辨率从 10ms 提到 1ms）。
 
 ### TIMER — 可选的 TIM 毫秒时基
 
